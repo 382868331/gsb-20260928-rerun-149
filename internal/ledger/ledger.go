@@ -90,12 +90,26 @@ func Open(name, dir string, clock *clock.SimClock) (*Ledger, error) {
 
 func (l *Ledger) Name() string { return l.name }
 
+func (l *Ledger) Now() time.Time { return l.clock.Now() }
+
 func (l *Ledger) EnsureAccount(address string, balance uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, ok := l.accounts[address]; !ok {
 		l.accounts[address] = &Account{Address: address, Balance: balance}
 	}
+	return l.saveLocked()
+}
+
+// Credit 仅供模拟环境注资虚拟余额，不涉及任何真实资产。
+func (l *Ledger) Credit(address string, amount uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	account := l.accounts[address]
+	if account == nil {
+		return fmt.Errorf("unknown account %s", address)
+	}
+	account.Balance += amount
 	return l.saveLocked()
 }
 
@@ -106,6 +120,32 @@ func (l *Ledger) Balance(address string) uint64 {
 		return account.Balance
 	}
 	return 0
+}
+
+// LockedBalance 返回某账户当前仍处于 locked 状态、尚未被领取或退回的资金。
+// 多笔转移并发时，已锁定的金额不能再次用于另一笔转移。
+func (l *Ledger) LockedBalance(address string) uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var total uint64
+	for _, escrow := range l.escrows {
+		if escrow.Status == StatusLocked && (escrow.From == address || escrow.To == address) {
+			total += escrow.Amount
+		}
+	}
+	return total
+}
+
+// AvailableBalance 是账户的可支配余额。锁定在本模型中立即从余额扣减
+// 并单独记录在 escrow 中，因此账户当前余额就是尚未被任何锁占用的部分。
+func (l *Ledger) AvailableBalance(address string) uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	account := l.accounts[address]
+	if account == nil {
+		return 0
+	}
+	return account.Balance
 }
 
 func (l *Ledger) Lock(req LockRequest) (*Escrow, error) {
@@ -212,6 +252,19 @@ func (l *Ledger) ListByTransfer(transferID string) []*Escrow {
 	var out []*Escrow
 	for _, escrow := range l.escrows {
 		if escrow.Transfer == transferID {
+			out = append(out, cloneEscrow(escrow))
+		}
+	}
+	return out
+}
+
+// ListLocked 返回该账本上仍处于 locked 状态的全部 escrow，供逐笔对账使用。
+func (l *Ledger) ListLocked() []*Escrow {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]*Escrow, 0)
+	for _, escrow := range l.escrows {
+		if escrow.Status == StatusLocked {
 			out = append(out, cloneEscrow(escrow))
 		}
 	}

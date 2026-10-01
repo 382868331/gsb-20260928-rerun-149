@@ -26,6 +26,11 @@ const (
 	StageMixedExpired      = "mixed_expired"
 )
 
+const (
+	TreasuryA = "treasury-a"
+	TreasuryB = "treasury-b"
+)
+
 type Instance struct {
 	ID       string    `json:"id"`
 	Sender   string    `json:"sender"`
@@ -72,12 +77,12 @@ func (c *Coordinator) Begin(id, sender, receiver string, amount uint64, duration
 	if err != nil {
 		return nil, err
 	}
-	lock := node.LockPayload{EscrowID: escrowID(id, "a"), Transfer: id, From: sender, To: "treasury-a", Amount: amount, HashLock: hash, Deadline: inst.Deadline.Add(c.offsetA)}
+	lock := node.LockPayload{EscrowID: escrowID(id, "a"), Transfer: id, From: sender, To: TreasuryA, Amount: amount, HashLock: hash, Deadline: inst.Deadline.Add(c.offsetA)}
 	if _, err := c.net.Send("coordinator", "ledger-a", message.KindLock, lock, 10*time.Millisecond); err != nil {
 		return nil, err
 	}
 	lock.EscrowID = escrowID(id, "b")
-	lock.From = "treasury-b"
+	lock.From = TreasuryB
 	lock.To = receiver
 	lock.Deadline = inst.Deadline.Add(c.offsetB)
 	_, err = c.net.Send("coordinator", "ledger-b", message.KindLock, lock, 25*time.Millisecond)
@@ -154,6 +159,48 @@ func (c *Coordinator) RefundExpired(id string) error {
 	}
 	for _, side := range []string{"a", "b"} {
 		if _, err := c.net.Send("coordinator", "ledger-"+side, message.KindRefund, node.IDPayload{EscrowID: escrowID(id, side)}, 10*time.Millisecond); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RecoverMissingLocks 在协调者失联恢复后使用：先重新核对两侧真实账本，
+// 只对账本上确实缺失、且本地截止时间尚未过去的一侧补发锁定消息。
+// 已锁定的一侧不会重复扣款；已过本地截止时间的一侧拒绝补发，只能走退款。
+func (c *Coordinator) RecoverMissingLocks(id string) error {
+	inst, err := c.Reconcile(id)
+	if err != nil {
+		return err
+	}
+	sideSpecs := []struct {
+		side   string
+		ledger *ledger.Ledger
+		from   string
+		to     string
+		offset time.Duration
+	}{
+		{"a", c.a, inst.Sender, TreasuryA, c.offsetA},
+		{"b", c.b, TreasuryB, inst.Receiver, c.offsetB},
+	}
+	for _, spec := range sideSpecs {
+		if _, err := spec.ledger.Status(escrowID(id, spec.side)); err == nil {
+			continue
+		}
+		deadline := inst.Deadline.Add(spec.offset)
+		if !spec.ledger.Now().Before(deadline) {
+			continue
+		}
+		payload := node.LockPayload{
+			EscrowID: escrowID(id, spec.side),
+			Transfer: id,
+			From:     spec.from,
+			To:       spec.to,
+			Amount:   inst.Amount,
+			HashLock: inst.HashLock,
+			Deadline: deadline,
+		}
+		if _, err := c.net.Send("coordinator", "ledger-"+spec.side, message.KindLock, payload, 10*time.Millisecond); err != nil {
 			return err
 		}
 	}
