@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -169,6 +170,77 @@ func (c *Coordinator) Get(id string) (*Instance, error) {
 	}
 	copy := *inst
 	return &copy, nil
+}
+
+// SideReport 描述某笔转移在单侧账本上的资金占用与可执行动作。
+type SideReport struct {
+	EscrowID string    `json:"escrow_id"`
+	Status   string    `json:"status"`
+	Locked   uint64    `json:"locked"`
+	Deadline time.Time `json:"deadline"`
+	Actions  []string  `json:"actions"`
+}
+
+// TransferReport 是协调者重新读取两侧实际账本后得到的逐笔对账结果。
+type TransferReport struct {
+	ID       string     `json:"id"`
+	Stage    string     `json:"stage"`
+	Amount   uint64     `json:"amount"`
+	Deadline time.Time  `json:"deadline"`
+	A        SideReport `json:"a"`
+	B        SideReport `json:"b"`
+}
+
+func sideReport(l *ledger.Ledger, escrowID string) SideReport {
+	report := SideReport{EscrowID: escrowID, Status: "missing"}
+	escrow, err := l.Status(escrowID)
+	if err != nil {
+		report.Actions = append(report.Actions, "无锁，无需动作")
+		return report
+	}
+	report.Status = escrow.Status
+	report.Deadline = escrow.Deadline
+	now := l.Now()
+	switch escrow.Status {
+	case ledger.StatusLocked:
+		report.Locked = escrow.Amount
+		if now.Before(escrow.Deadline) {
+			report.Actions = append(report.Actions, "claim:提交 secret 领取，本地截止 "+escrow.Deadline.Format(time.RFC3339))
+		} else {
+			report.Actions = append(report.Actions, "refund:已过本地截止，可立即退回")
+		}
+	case ledger.StatusClaimed, ledger.StatusRefunded:
+		report.Actions = append(report.Actions, "终态 "+escrow.Status+"，不可再领取或退回")
+	}
+	return report
+}
+
+// Audit 逐笔重新读取两侧实际账本，返回每笔仍被锁住的金额、可采取的动作及其时限。
+// 协调者长时间失联后必须调用它，而不是只依据过期的协调日志继续发款。
+func (c *Coordinator) Audit() ([]TransferReport, error) {
+	c.mu.Lock()
+	ids := make([]string, 0, len(c.instances))
+	for id := range c.instances {
+		ids = append(ids, id)
+	}
+	c.mu.Unlock()
+	sort.Strings(ids)
+	reports := make([]TransferReport, 0, len(ids))
+	for _, id := range ids {
+		inst, err := c.Reconcile(id)
+		if err != nil {
+			return nil, err
+		}
+		reports = append(reports, TransferReport{
+			ID:       inst.ID,
+			Stage:    inst.Stage,
+			Amount:   inst.Amount,
+			Deadline: inst.Deadline,
+			A:        sideReport(c.a, escrowID(id, "a")),
+			B:        sideReport(c.b, escrowID(id, "b")),
+		})
+	}
+	return reports, nil
 }
 
 func (c *Coordinator) SetClockOffsets(offsetA, offsetB time.Duration) {

@@ -8,7 +8,7 @@ import (
 
 	"crossledgerlab/internal/lab"
 	"crossledgerlab/internal/ledger"
-	"crossledgerlab/internal/protocol"
+	"crossledgerlab/internal/message"
 )
 
 func main() {
@@ -21,74 +21,84 @@ func main() {
 	rt, err := lab.NewRuntime(*dir, start, offsetA, offsetB)
 	must(err)
 
-	const transferID = "demo-1"
-	deadline := start.Add(time.Hour)
 	fmt.Printf("参考时钟=%s；账本A时钟偏移=%s；账本B时钟偏移=%s\n", start.UTC().Format(time.RFC3339), offsetA, offsetB)
-	fmt.Println("发起跨系统虚拟转移：alice 锁 100，A 到账确认延迟 10ms，B 到账确认延迟 25ms")
-	inst, err := rt.Coordinator.Begin(transferID, "alice", "bob", 100, time.Hour)
-	must(err)
-	fmt.Printf("协议=%s；统一退款截止点=%s\n", inst.Stage, deadline.Format(time.RFC3339))
+	fmt.Println("同一参与者 alice（余额 1000）同时发起多笔转移：demo-1=100、demo-2=250、demo-3=600、demo-4=100")
+	mustBegin(rt, "demo-1", 100, time.Hour)
+	mustBegin(rt, "demo-2", 250, 2*time.Hour)
+	mustBegin(rt, "demo-3", 600, 3*time.Hour)
+	mustBegin(rt, "demo-4", 100, time.Hour)
 
 	fmt.Println("立即断开 ledger-b，只投递 A 的锁定消息")
 	rt.Network.SetDisconnected("ledger-b", true)
-	advance(rt, 20*time.Millisecond)
-	_, err = rt.Coordinator.Reconcile(transferID)
-	must(err)
-	printState("A锁定/B断连", rt, transferID)
+	records := advance(rt, 40*time.Millisecond)
+	for _, record := range records {
+		if errors.Is(record.Err, ledger.ErrInsufficientFunds) {
+			fmt.Printf("demo-4 被 A 拒绝：%v（前 3 笔已占用 950，剩余 50 不足以再锁 100）\n", record.Err)
+		}
+	}
+	fmt.Printf("alice 可用余额=%d（950 被三笔并发转移占用，已锁资金不能再次使用）\n", rt.LedgerA.Balance("alice"))
 
-	fmt.Println("协调者重启：重新打开网络、协议实例与两套实际账本")
+	fmt.Println("协调者长时间失联：推进 90 分钟后重启，重新读取两侧实际账本核实")
 	rt, err = lab.RestartRuntime(*dir, rt.RefClock.Now(), offsetA, offsetB)
 	must(err)
+	rt.RefClock.Advance(90 * time.Minute)
+	rt.ClockA.Advance(90 * time.Minute)
+	rt.ClockB.Advance(90 * time.Minute)
 	rt.Network.SetDisconnected("ledger-b", true)
-	inst, err = rt.Coordinator.Reconcile(transferID)
-	must(err)
-	fmt.Printf("从实际账本恢复协议状态=%s；不是只读取协调者日志\n", inst.Stage)
-	fmt.Printf("100 个虚拟单位仍锁在 A；到达 %s 后可由 A 退回 alice\n", deadline.Format(time.RFC3339))
+	printAudit(rt)
 
-	fmt.Println("推进到超时之后，恢复 B 连接并投递积压消息")
-	advance(rt, time.Hour+time.Second)
+	fmt.Println("恢复 B 连接并投递积压消息；demo-1 的过期 B 锁将被拒绝")
 	rt.Network.SetDisconnected("ledger-b", false)
 	rt.Network.RestoreDisconnected()
-	records, err := rt.Network.Pump()
+	records, err = rt.Network.Pump()
 	must(err)
 	for _, record := range records {
 		if record.Err != nil {
-			fmt.Printf("过期消息 %s -> %s/%s 被账本拒绝：%v\n", record.Message.From, record.Message.To, record.Message.Kind, record.Err)
+			fmt.Printf("过期消息 -> %s/%s 被账本拒绝：%v\n", record.Message.To, record.Message.Kind, record.Err)
 		}
 	}
 
-	fmt.Println("执行超时退回；A 上的锁退回，B 从未形成锁")
-	must(rt.Coordinator.RefundExpired(transferID))
+	fmt.Println("对已过截止的 demo-1 执行超时退回")
+	must(rt.Coordinator.RefundExpired("demo-1"))
 	advance(rt, 35*time.Millisecond)
-	inst, err = rt.Coordinator.Reconcile(transferID)
-	must(err)
-	printState("超时处理后", rt, transferID)
-	fmt.Printf("最终协议=%s；本演练不涉及任何真实资产\n", inst.Stage)
+	printAudit(rt)
+	fmt.Println("本演练只使用虚拟余额与模拟时钟，不接入任何真实账本或资产")
 }
 
-func advance(rt *lab.Runtime, d time.Duration) {
+func mustBegin(rt *lab.Runtime, id string, amount uint64, duration time.Duration) {
+	_, err := rt.Coordinator.Begin(id, "alice", "bob", amount, duration)
+	must(err)
+}
+
+func printAudit(rt *lab.Runtime) {
+	reports, err := rt.Coordinator.Audit()
+	must(err)
+	fmt.Println("逐笔对账（来自两侧实际账本，而非协调者过期日志）：")
+	for _, report := range reports {
+		fmt.Printf("  %s 阶段=%s 总额=%d 统一截止=%s\n", report.ID, report.Stage, report.Amount, report.Deadline.Format(time.RFC3339))
+		fmt.Printf("    A侧 状态=%s 仍锁=%d 动作=%s\n", report.A.Status, report.A.Locked, joinActions(report.A.Actions))
+		fmt.Printf("    B侧 状态=%s 仍锁=%d 动作=%s\n", report.B.Status, report.B.Locked, joinActions(report.B.Actions))
+	}
+}
+
+func joinActions(actions []string) string {
+	out := ""
+	for i, action := range actions {
+		if i > 0 {
+			out += "；"
+		}
+		out += action
+	}
+	return out
+}
+
+func advance(rt *lab.Runtime, d time.Duration) []message.Record {
 	rt.RefClock.Advance(d)
 	rt.ClockA.Advance(d)
 	rt.ClockB.Advance(d)
-	_, err := rt.Network.Pump()
+	records, err := rt.Network.Pump()
 	must(err)
-}
-
-func printState(label string, rt *lab.Runtime, id string) {
-	a, errA := rt.LedgerA.Status(protocol.EscrowID(id, "a"))
-	b, errB := rt.LedgerB.Status(protocol.EscrowID(id, "b"))
-	fmt.Printf("[%s] A锁=%s，B锁=%s；alice=%d，treasury-b=%d，bob=%d；网络待投递:A=%d B=%d\n",
-		label, status(a, errA), status(b, errB), rt.LedgerA.Balance("alice"), rt.LedgerB.Balance("treasury-b"), rt.LedgerB.Balance("bob"), rt.Network.PendingCount("ledger-a"), rt.Network.PendingCount("ledger-b"))
-}
-
-func status(escrow *ledger.Escrow, err error) string {
-	if errors.Is(err, ledger.ErrMissing) {
-		return "不存在"
-	}
-	if err != nil {
-		return err.Error()
-	}
-	return escrow.Status
+	return records
 }
 
 func must(err error) {

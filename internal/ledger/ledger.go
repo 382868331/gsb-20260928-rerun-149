@@ -90,6 +90,8 @@ func Open(name, dir string, clock *clock.SimClock) (*Ledger, error) {
 
 func (l *Ledger) Name() string { return l.name }
 
+func (l *Ledger) Now() time.Time { return l.clock.Now() }
+
 func (l *Ledger) EnsureAccount(address string, balance uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
