@@ -23,6 +23,8 @@ type LockPayload struct {
 
 type SecretPayload struct {
 	EscrowID string `json:"escrow_id"`
+	ClaimID  string `json:"claim_id"`
+	Amount   uint64 `json:"amount"`
 	Secret   []byte `json:"secret"`
 }
 
@@ -31,8 +33,10 @@ type IDPayload struct {
 }
 
 type AckPayload struct {
-	Correlation string `json:"correlation"`
-	Status      string `json:"status"`
+	Correlation    string `json:"correlation"`
+	Status         string `json:"status"`
+	ConfirmedTotal uint64 `json:"confirmed_total,omitempty"`
+	Remaining      uint64 `json:"remaining,omitempty"`
 }
 
 type Node struct {
@@ -79,9 +83,11 @@ func (n *Node) Handle(msg message.Message) (*message.Message, error) {
 		p, err := message.Decode[SecretPayload](msg)
 		if err == nil {
 			var escrow *ledger.Escrow
-			escrow, err = n.ledger.Claim(p.EscrowID, p.Secret)
+			escrow, err = n.ledger.Claim(p.EscrowID, p.Secret, p.ClaimID, p.Amount)
 			if escrow != nil {
 				ack.Status = escrow.Status
+				ack.ConfirmedTotal = escrow.Claimed
+				ack.Remaining = escrow.Remaining()
 			}
 		}
 		handleErr = err
@@ -92,6 +98,8 @@ func (n *Node) Handle(msg message.Message) (*message.Message, error) {
 			escrow, err = n.ledger.Refund(p.EscrowID)
 			if escrow != nil {
 				ack.Status = escrow.Status
+				ack.ConfirmedTotal = escrow.Claimed
+				ack.Remaining = escrow.Remaining()
 			}
 		}
 		handleErr = err

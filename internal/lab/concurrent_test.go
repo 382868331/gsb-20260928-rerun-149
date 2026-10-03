@@ -1,6 +1,7 @@
 package lab
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -74,8 +75,9 @@ func TestClaimRefundCollisionSingleTerminalState(t *testing.T) {
 	const goroutines = 16
 	errs := make(chan error, goroutines*2)
 	for i := 0; i < goroutines; i++ {
+		claimID := fmt.Sprintf("race-claim-%d", i)
 		go func() {
-			_, err := rt.LedgerA.Claim("race-a", secret)
+			_, err := rt.LedgerA.Claim("race-a", secret, claimID, 100)
 			errs <- err
 		}()
 		go func() {

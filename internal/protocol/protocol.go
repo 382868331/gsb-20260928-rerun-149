@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -24,8 +26,21 @@ const (
 	StageClaimed           = "claimed"
 	StagePartiallyRefunded = "partially_refunded"
 	StageRefunded          = "refunded"
-	StageMixedExpired      = "mixed_expired"
+	StageMixedSettled      = "mixed_settled"
 )
+
+// ErrPendingClaims 表示仍有已发出但未确认的领取决定；
+// 未知领取不能在等待确认期间被退款，需先 ResumePending 追查原决定。
+var ErrPendingClaims = errors.New("unconfirmed claims pending; resume and confirm before refund")
+
+// ClaimIntent 是协调者持久化的一笔分次领取决定。
+// 重开或回应丢失后用同一 ID 继续追查，不以新编号重做可能已发生的效果。
+type ClaimIntent struct {
+	ID             string `json:"id"`
+	Amount         uint64 `json:"amount"`
+	Confirmed      bool   `json:"confirmed"`
+	ConfirmedTotal uint64 `json:"confirmed_total"`
+}
 
 type Instance struct {
 	ID       string    `json:"id"`
@@ -36,6 +51,7 @@ type Instance struct {
 	Secret   []byte    `json:"secret,omitempty"`
 	Deadline time.Time `json:"deadline"`
 	Stage    string    `json:"stage"`
+	Claims   []ClaimIntent `json:"claims,omitempty"`
 }
 
 type Coordinator struct {
@@ -92,28 +108,33 @@ func (c *Coordinator) Reconcile(id string) (*Instance, error) {
 	if inst == nil {
 		return nil, ledger.ErrMissing
 	}
+	c.syncConfirmations(inst)
 	a, aErr := c.a.Status(escrowID(id, "a"))
 	b, bErr := c.b.Status(escrowID(id, "b"))
-	statuses := map[string]int{}
-	statuses[countState(a, aErr)]++
-	statuses[countState(b, bErr)]++
-	lockedCount := statuses[ledger.StatusLocked]
-	claimedCount := statuses[ledger.StatusClaimed]
-	refundedCount := statuses[ledger.StatusRefunded]
+	stateA, stateB := countState(a, aErr), countState(b, bErr)
+	final := func(s string) bool {
+		return s == ledger.StatusClaimed || s == ledger.StatusRefunded || s == ledger.StatusMixedSettled
+	}
+	hasClaim := func(s string) bool {
+		return s == ledger.StatusClaimed || s == ledger.StatusPartiallyClaimed || s == ledger.StatusMixedSettled
+	}
+	hasRefund := func(s string) bool {
+		return s == ledger.StatusRefunded || s == ledger.StatusMixedSettled
+	}
 	switch {
-	case claimedCount == 2:
+	case stateA == ledger.StatusClaimed && stateB == ledger.StatusClaimed:
 		inst.Stage = StageClaimed
-	case refundedCount == 2:
+	case stateA == ledger.StatusRefunded && stateB == ledger.StatusRefunded:
 		inst.Stage = StageRefunded
-	case claimedCount > 0 && refundedCount > 0:
-		inst.Stage = StageMixedExpired
-	case lockedCount == 2:
-		inst.Stage = StageLocked
-	case claimedCount > 0:
+	case final(stateA) && final(stateB):
+		inst.Stage = StageMixedSettled
+	case hasClaim(stateA) || hasClaim(stateB):
 		inst.Stage = StagePartiallyClaimed
-	case refundedCount > 0:
+	case hasRefund(stateA) || hasRefund(stateB):
 		inst.Stage = StagePartiallyRefunded
-	case lockedCount > 0:
+	case stateA == ledger.StatusLocked && stateB == ledger.StatusLocked:
+		inst.Stage = StageLocked
+	case stateA == ledger.StatusLocked || stateB == ledger.StatusLocked:
 		inst.Stage = StagePartiallyLocked
 	default:
 		inst.Stage = StageCreated
@@ -124,34 +145,131 @@ func (c *Coordinator) Reconcile(id string) (*Instance, error) {
 	return inst, err
 }
 
+// syncConfirmations 以实际账本为准核对每笔领取决定：账本上存在同 ID 记录即视为已确认，
+// 即使当初的回应丢失也不会重复扣款。
+func (c *Coordinator) syncConfirmations(inst *Instance) {
+	changed := false
+	for i, intent := range inst.Claims {
+		if intent.Confirmed {
+			continue
+		}
+		record, err := c.b.ClaimRecord(escrowID(inst.ID, "b"), intent.ID)
+		if err != nil {
+			continue
+		}
+		inst.Claims[i].Confirmed = true
+		inst.Claims[i].ConfirmedTotal = record.ConfirmedTotal
+		changed = true
+	}
+	if changed {
+		c.mu.Lock()
+		c.saveLocked()
+		c.mu.Unlock()
+	}
+}
+
+// Claim 一次性领取全部金额（兼容旧接口），等价于一笔全额分次领取。
 func (c *Coordinator) Claim(id string) error {
+	inst, err := c.Get(id)
+	if err != nil {
+		return err
+	}
+	_, err = c.ClaimPartial(id, inst.Amount)
+	return err
+}
+
+// ClaimPartial 发起一笔分次领取：接收方可分几次领取，未领取余额到期后退回。
+// 第一次领取只确认本次金额，不把整笔视为结清。
+func (c *Coordinator) ClaimPartial(id string, amount uint64) (string, error) {
 	c.mu.Lock()
 	inst := c.instances[id]
 	c.mu.Unlock()
 	if inst == nil {
-		return ledger.ErrMissing
+		return "", ledger.ErrMissing
 	}
 	if _, err := c.Reconcile(id); err != nil {
-		return err
+		return "", err
 	}
-	if inst.Stage != StageLocked {
-		return nil
+	if inst.Stage != StageLocked && inst.Stage != StagePartiallyClaimed {
+		return "", nil
 	}
-	p := node.SecretPayload{EscrowID: escrowID(id, "b"), Secret: inst.Secret}
+	intent := ClaimIntent{ID: fmt.Sprintf("%s-claim-%d", id, len(inst.Claims)+1), Amount: amount}
+	c.mu.Lock()
+	inst.Claims = append(inst.Claims, intent)
+	err := c.saveLocked()
+	c.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	return intent.ID, c.sendClaimMessages(inst, intent)
+}
+
+func (c *Coordinator) sendClaimMessages(inst *Instance, intent ClaimIntent) error {
+	p := node.SecretPayload{EscrowID: escrowID(inst.ID, "b"), ClaimID: intent.ID, Amount: intent.Amount, Secret: inst.Secret}
 	if _, err := c.net.Send("coordinator", "ledger-b", message.KindClaim, p, 15*time.Millisecond); err != nil {
 		return err
 	}
-	p.EscrowID = escrowID(id, "a")
+	p.EscrowID = escrowID(inst.ID, "a")
 	_, err := c.net.Send("coordinator", "ledger-a", message.KindClaim, p, 30*time.Millisecond)
 	return err
 }
 
+// ResumePending 重开后继续追查原领取决定：用持久化的同一 claim ID 重发，
+// 账本按 claim ID 幂等，可能已发生的效果不会被重做。
+func (c *Coordinator) ResumePending(id string) ([]string, error) {
+	c.mu.Lock()
+	inst := c.instances[id]
+	c.mu.Unlock()
+	if inst == nil {
+		return nil, ledger.ErrMissing
+	}
+	if _, err := c.Reconcile(id); err != nil {
+		return nil, err
+	}
+	var resent []string
+	for _, intent := range inst.Claims {
+		if intent.Confirmed {
+			continue
+		}
+		if err := c.sendClaimMessages(inst, intent); err != nil {
+			return resent, err
+		}
+		resent = append(resent, intent.ID)
+	}
+	return resent, nil
+}
+
+// PendingClaims 返回仍未确认的领取决定 ID。
+func (c *Coordinator) PendingClaims(id string) ([]string, error) {
+	inst, err := c.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	var pending []string
+	for _, intent := range inst.Claims {
+		if !intent.Confirmed {
+			pending = append(pending, intent.ID)
+		}
+	}
+	return pending, nil
+}
+
+// RefundExpired 退回过期转移的未领取余额。
+// 存在未确认领取决定时拒绝退款（ErrPendingClaims）：未知领取不能一边等待确认一边被退款。
 func (c *Coordinator) RefundExpired(id string) error {
 	c.mu.Lock()
 	inst := c.instances[id]
 	c.mu.Unlock()
 	if inst == nil || !c.clock.Now().After(inst.Deadline) {
 		return ledger.ErrDeadlineNotPassed
+	}
+	if _, err := c.Reconcile(id); err != nil {
+		return err
+	}
+	for _, intent := range inst.Claims {
+		if !intent.Confirmed {
+			return ErrPendingClaims
+		}
 	}
 	for _, side := range []string{"a", "b"} {
 		if _, err := c.net.Send("coordinator", "ledger-"+side, message.KindRefund, node.IDPayload{EscrowID: escrowID(id, side)}, 10*time.Millisecond); err != nil {
@@ -174,21 +292,26 @@ func (c *Coordinator) Get(id string) (*Instance, error) {
 
 // SideReport 描述某笔转移在单侧账本上的资金占用与可执行动作。
 type SideReport struct {
-	EscrowID string    `json:"escrow_id"`
-	Status   string    `json:"status"`
-	Locked   uint64    `json:"locked"`
-	Deadline time.Time `json:"deadline"`
-	Actions  []string  `json:"actions"`
+	EscrowID  string              `json:"escrow_id"`
+	Status    string              `json:"status"`
+	Locked    uint64              `json:"locked"`
+	Claimed   uint64              `json:"claimed"`
+	Refunded  uint64              `json:"refunded"`
+	Remaining uint64              `json:"remaining"`
+	Claims    []ledger.ClaimRecord `json:"claims,omitempty"`
+	Deadline  time.Time           `json:"deadline"`
+	Actions   []string            `json:"actions"`
 }
 
 // TransferReport 是协调者重新读取两侧实际账本后得到的逐笔对账结果。
 type TransferReport struct {
-	ID       string     `json:"id"`
-	Stage    string     `json:"stage"`
-	Amount   uint64     `json:"amount"`
-	Deadline time.Time  `json:"deadline"`
-	A        SideReport `json:"a"`
-	B        SideReport `json:"b"`
+	ID            string     `json:"id"`
+	Stage         string     `json:"stage"`
+	Amount        uint64     `json:"amount"`
+	Deadline      time.Time  `json:"deadline"`
+	PendingClaims []string   `json:"pending_claims,omitempty"`
+	A             SideReport `json:"a"`
+	B             SideReport `json:"b"`
 }
 
 func sideReport(l *ledger.Ledger, escrowID string) SideReport {
@@ -200,16 +323,20 @@ func sideReport(l *ledger.Ledger, escrowID string) SideReport {
 	}
 	report.Status = escrow.Status
 	report.Deadline = escrow.Deadline
+	report.Claimed = escrow.Claimed
+	report.Refunded = escrow.Refunded
+	report.Remaining = escrow.Remaining()
+	report.Claims = escrow.Claims
 	now := l.Now()
 	switch escrow.Status {
-	case ledger.StatusLocked:
-		report.Locked = escrow.Amount
+	case ledger.StatusLocked, ledger.StatusPartiallyClaimed:
+		report.Locked = escrow.Remaining()
 		if now.Before(escrow.Deadline) {
-			report.Actions = append(report.Actions, "claim:提交 secret 领取，本地截止 "+escrow.Deadline.Format(time.RFC3339))
+			report.Actions = append(report.Actions, fmt.Sprintf("claim:提交 secret 分次领取（剩余 %d），本地截止 %s", escrow.Remaining(), escrow.Deadline.Format(time.RFC3339)))
 		} else {
-			report.Actions = append(report.Actions, "refund:已过本地截止，可立即退回")
+			report.Actions = append(report.Actions, fmt.Sprintf("refund:已过本地截止，可退回剩余 %d", escrow.Remaining()))
 		}
-	case ledger.StatusClaimed, ledger.StatusRefunded:
+	case ledger.StatusClaimed, ledger.StatusRefunded, ledger.StatusMixedSettled:
 		report.Actions = append(report.Actions, "终态 "+escrow.Status+"，不可再领取或退回")
 	}
 	return report
@@ -231,13 +358,20 @@ func (c *Coordinator) Audit() ([]TransferReport, error) {
 		if err != nil {
 			return nil, err
 		}
+		var pending []string
+		for _, intent := range inst.Claims {
+			if !intent.Confirmed {
+				pending = append(pending, intent.ID)
+			}
+		}
 		reports = append(reports, TransferReport{
-			ID:       inst.ID,
-			Stage:    inst.Stage,
-			Amount:   inst.Amount,
-			Deadline: inst.Deadline,
-			A:        sideReport(c.a, escrowID(id, "a")),
-			B:        sideReport(c.b, escrowID(id, "b")),
+			ID:            inst.ID,
+			Stage:         inst.Stage,
+			Amount:        inst.Amount,
+			Deadline:      inst.Deadline,
+			PendingClaims: pending,
+			A:             sideReport(c.a, escrowID(id, "a")),
+			B:             sideReport(c.b, escrowID(id, "b")),
 		})
 	}
 	return reports, nil

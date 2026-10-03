@@ -14,9 +14,11 @@ import (
 )
 
 const (
-	StatusLocked   = "locked"
-	StatusClaimed  = "claimed"
-	StatusRefunded = "refunded"
+	StatusLocked           = "locked"
+	StatusPartiallyClaimed = "partially_claimed"
+	StatusClaimed          = "claimed"
+	StatusRefunded         = "refunded"
+	StatusMixedSettled     = "mixed_settled"
 )
 
 var (
@@ -26,6 +28,8 @@ var (
 	ErrDeadlinePassed    = errors.New("claim deadline passed")
 	ErrDeadlineNotPassed = errors.New("refund deadline has not passed")
 	ErrMissing           = errors.New("escrow missing")
+	ErrBadAmount         = errors.New("claim amount must be positive")
+	ErrExceedsRemaining  = errors.New("claim amount exceeds remaining escrow balance")
 )
 
 type Account struct {
@@ -43,7 +47,24 @@ type Escrow struct {
 	Deadline  time.Time `json:"deadline"`
 	Status    string    `json:"status"`
 	Secret    []byte    `json:"secret,omitempty"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Claimed   uint64        `json:"claimed"`
+	Refunded  uint64        `json:"refunded"`
+	Claims    []ClaimRecord `json:"claims,omitempty"`
+	UpdatedAt time.Time     `json:"updated_at"`
+}
+
+// ClaimRecord 是一笔已确认的分次领取记录：本次金额、累计已确认总额、领取后仍不确定的剩余部分。
+type ClaimRecord struct {
+	ID             string    `json:"id"`
+	Amount         uint64    `json:"amount"`
+	ConfirmedTotal uint64    `json:"confirmed_total"`
+	Remaining      uint64    `json:"remaining"`
+	RecordedAt     time.Time `json:"recorded_at"`
+}
+
+// Remaining 返回 escrow 中尚未领取也未退回的金额。
+func (e *Escrow) Remaining() uint64 {
+	return e.Amount - e.Claimed - e.Refunded
 }
 
 type LockRequest struct {
@@ -147,17 +168,21 @@ func (l *Ledger) Lock(req LockRequest) (*Escrow, error) {
 	return cloneEscrow(escrow), l.saveLocked()
 }
 
-func (l *Ledger) Claim(id string, secret []byte) (*Escrow, error) {
+// Claim 记录一笔分次领取。claimID 是领取决定的稳定标识：
+// 重复请求或回应丢失后的重传携带同一 claimID，直接返回已确认记录，不会重复加款。
+func (l *Ledger) Claim(id string, secret []byte, claimID string, amount uint64) (*Escrow, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	escrow := l.escrows[id]
 	if escrow == nil {
 		return nil, ErrMissing
 	}
-	if escrow.Status == StatusClaimed {
-		return cloneEscrow(escrow), nil
+	for _, record := range escrow.Claims {
+		if record.ID == claimID {
+			return cloneEscrow(escrow), nil
+		}
 	}
-	if escrow.Status == StatusRefunded {
+	if escrow.Remaining() == 0 {
 		return nil, ErrAlreadyFinal
 	}
 	hash := sha256.Sum256(secret)
@@ -167,14 +192,48 @@ func (l *Ledger) Claim(id string, secret []byte) (*Escrow, error) {
 	if l.clock.Now().After(escrow.Deadline) {
 		return nil, ErrDeadlinePassed
 	}
+	if amount == 0 {
+		return nil, ErrBadAmount
+	}
+	if amount > escrow.Remaining() {
+		return nil, ErrExceedsRemaining
+	}
 	to := l.accounts[escrow.To]
-	to.Balance += escrow.Amount
-	escrow.Status = StatusClaimed
+	to.Balance += amount
+	escrow.Claimed += amount
+	escrow.Claims = append(escrow.Claims, ClaimRecord{
+		ID:             claimID,
+		Amount:         amount,
+		ConfirmedTotal: escrow.Claimed,
+		Remaining:      escrow.Remaining(),
+		RecordedAt:     l.clock.Now(),
+	})
 	escrow.Secret = append([]byte(nil), secret...)
 	escrow.UpdatedAt = l.clock.Now()
+	l.updateStatusLocked(escrow)
 	return cloneEscrow(escrow), l.saveLocked()
 }
 
+// ClaimRecord 返回某笔已确认领取的记录，供协调者重开后核对原决定。
+func (l *Ledger) ClaimRecord(id, claimID string) (*ClaimRecord, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	escrow := l.escrows[id]
+	if escrow == nil {
+		return nil, ErrMissing
+	}
+	for _, record := range escrow.Claims {
+		if record.ID == claimID {
+			copy := record
+			return &copy, nil
+		}
+	}
+	return nil, ErrMissing
+}
+
+// Refund 在截止时间之后把剩余未领取余额退回付款方。
+// 决定边界：领取在 now <= deadline 有效，退回仅在 now > deadline 有效，二者互斥。
+// 已部分领取的 escrow 只退回剩余部分；重复退回请求幂等，不会二次加款。
 func (l *Ledger) Refund(id string) (*Escrow, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -182,20 +241,36 @@ func (l *Ledger) Refund(id string) (*Escrow, error) {
 	if escrow == nil {
 		return nil, ErrMissing
 	}
-	if escrow.Status == StatusRefunded {
+	if escrow.Remaining() == 0 {
+		if escrow.Claimed == escrow.Amount {
+			return nil, ErrAlreadyFinal
+		}
 		return cloneEscrow(escrow), nil
 	}
-	if escrow.Status == StatusClaimed {
-		return nil, ErrAlreadyFinal
-	}
-	if l.clock.Now().Before(escrow.Deadline) {
+	if !l.clock.Now().After(escrow.Deadline) {
 		return nil, ErrDeadlineNotPassed
 	}
 	from := l.accounts[escrow.From]
-	from.Balance += escrow.Amount
-	escrow.Status = StatusRefunded
+	from.Balance += escrow.Remaining()
+	escrow.Refunded += escrow.Remaining()
 	escrow.UpdatedAt = l.clock.Now()
+	l.updateStatusLocked(escrow)
 	return cloneEscrow(escrow), l.saveLocked()
+}
+
+func (l *Ledger) updateStatusLocked(escrow *Escrow) {
+	switch {
+	case escrow.Claimed == escrow.Amount:
+		escrow.Status = StatusClaimed
+	case escrow.Refunded == escrow.Amount:
+		escrow.Status = StatusRefunded
+	case escrow.Claimed+escrow.Refunded == escrow.Amount:
+		escrow.Status = StatusMixedSettled
+	case escrow.Claimed > 0:
+		escrow.Status = StatusPartiallyClaimed
+	default:
+		escrow.Status = StatusLocked
+	}
 }
 
 func (l *Ledger) Status(id string) (*Escrow, error) {
@@ -235,6 +310,7 @@ func cloneEscrow(in *Escrow) *Escrow {
 	out := *in
 	out.HashLock = append([]byte(nil), in.HashLock...)
 	out.Secret = append([]byte(nil), in.Secret...)
+	out.Claims = append([]ClaimRecord(nil), in.Claims...)
 	return &out
 }
 
