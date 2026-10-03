@@ -77,17 +77,28 @@ func (n *Network) SetDisconnected(endpoint string, disconnected bool) {
 }
 
 func (n *Network) Send(from, to, kind string, payload any, delay time.Duration) (Message, error) {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return Message{}, err
-	}
 	var idBytes [16]byte
 	if _, err := rand.Read(idBytes[:]); err != nil {
 		return Message{}, err
 	}
+	return n.SendWithID(hex.EncodeToString(idBytes[:]), from, to, kind, payload, delay)
+}
+
+// SendWithID 使用调用方给定的确定消息 ID 发送；相同 ID 的消息已存在时直接返回原消息，
+// 协调者重启后可用原编号重发同一决定，而不会产生第二笔效果。
+func (n *Network) SendWithID(id, from, to, kind string, payload any, delay time.Duration) (Message, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return Message{}, err
+	}
 	now := n.now().UTC()
-	msg := Message{ID: hex.EncodeToString(idBytes[:]), From: from, To: to, Kind: kind, Payload: data, SendAt: now, ReadyAt: now.Add(delay)}
+	msg := Message{ID: id, From: from, To: to, Kind: kind, Payload: data, SendAt: now, ReadyAt: now.Add(delay)}
 	n.mu.Lock()
+	if existing := n.messages[id]; existing != nil {
+		copy := cloneMessage(existing)
+		n.mu.Unlock()
+		return copy, nil
+	}
 	if n.disabled[to] {
 		msg.ReadyAt = time.Time{}
 	}

@@ -9,6 +9,7 @@ import (
 	"crossledgerlab/internal/lab"
 	"crossledgerlab/internal/ledger"
 	"crossledgerlab/internal/message"
+	"crossledgerlab/internal/protocol"
 )
 
 func main() {
@@ -62,7 +63,61 @@ func main() {
 	must(rt.Coordinator.RefundExpired("demo-1"))
 	advance(rt, 35*time.Millisecond)
 	printAudit(rt)
+
+	fmt.Println("--- 分次领取演练：demo-5=100，bob 分次领取 40、30，剩余 30 到期退回 ---")
+	mustBegin(rt, "demo-5", 100, 30*time.Minute)
+	advance(rt, 40*time.Millisecond)
+
+	fmt.Println("第一次分次领取 40（第一次领取不等于整笔结清）")
+	_, err = rt.Coordinator.DecideClaim("demo-5", 40)
+	must(err)
+	advance(rt, 40*time.Millisecond)
+	printClaims(rt, "demo-5")
+
+	fmt.Println("模拟回应丢失：协调者重启，用原编号追查同一决定，不重复扣款")
+	rt, err = lab.RestartRuntime(*dir, rt.RefClock.Now(), offsetA, offsetB)
+	must(err)
+	must(rt.Coordinator.SyncClaims("demo-5"))
+	advance(rt, 40*time.Millisecond)
+	fmt.Printf("重发原决定后 bob 余额=%d（仍为 40，未重复入账）\n", rt.LedgerB.Balance("bob"))
+
+	fmt.Println("第二次分次领取 30")
+	_, err = rt.Coordinator.DecideClaim("demo-5", 30)
+	must(err)
+	advance(rt, 40*time.Millisecond)
+	printClaims(rt, "demo-5")
+	printConservation(rt)
+
+	fmt.Println("推进到截止之后，剩余 30 退回；已领取的 70 不受影响")
+	advance(rt, 31*time.Minute)
+	must(rt.Coordinator.RefundExpired("demo-5"))
+	advance(rt, 40*time.Millisecond)
+	printClaims(rt, "demo-5")
+	printAudit(rt)
+	printConservation(rt)
 	fmt.Println("本演练只使用虚拟余额与模拟时钟，不接入任何真实账本或资产")
+}
+
+func printClaims(rt *lab.Runtime, id string) {
+	escrow, err := rt.LedgerB.Status(protocol.EscrowID(id, "b"))
+	must(err)
+	fmt.Printf("%s B侧状态=%s（partially_claimed=一部分已结清，claimed=整笔完全结束）已确认=%d 仍锁定=%d\n",
+		id, escrow.Status, escrow.ClaimedAmount, escrow.Remaining())
+	for _, record := range escrow.Claims {
+		fmt.Printf("  领取记录 %s：本次=%d 已确认总额=%d 仍不确定=%d\n", record.ClaimID, record.Amount, record.Confirmed, record.Remaining)
+	}
+	if escrow.RefundedAmount > 0 {
+		fmt.Printf("  到期退回：%d\n", escrow.RefundedAmount)
+	}
+}
+
+func printConservation(rt *lab.Runtime) {
+	aTotal := rt.LedgerA.TotalBalance() + rt.LedgerA.LockedTotal()
+	bTotal := rt.LedgerB.TotalBalance() + rt.LedgerB.LockedTotal()
+	fmt.Printf("金额守恒核对：A 余额+锁定=%d（应=1000），B 余额+锁定=%d（应=1000）\n", aTotal, bTotal)
+	if aTotal != 1000 || bTotal != 1000 {
+		panic("金额不守恒")
+	}
 }
 
 func mustBegin(rt *lab.Runtime, id string, amount uint64, duration time.Duration) {
