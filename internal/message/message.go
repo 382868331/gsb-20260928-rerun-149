@@ -167,6 +167,18 @@ func (n *Network) PendingCount(endpoint string) int {
 	return count
 }
 
+// Delivered 查询某条确定 ID 的消息是否已投递；known=false 表示协调者尚未发出该消息。
+// 退款前用它区分“已投递但被账本拒绝”与“仍在途中/对侧断连”的领取决定。
+func (n *Network) Delivered(id string) (delivered bool, known bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	msg := n.messages[id]
+	if msg == nil {
+		return false, false
+	}
+	return msg.Delivered, true
+}
+
 func (n *Network) markDelivered(id string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()

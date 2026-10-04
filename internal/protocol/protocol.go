@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -28,6 +30,16 @@ const (
 	StageMixedExpired      = "mixed_expired"
 )
 
+// 领取决定在单侧账本上的核对结论。
+const (
+	DecisionConfirmed = "confirmed" // 已发生：账本中存在该 claim_id 的领取记录
+	DecisionRejected  = "rejected"  // 明确拒绝：消息已投递但账本未记账（如迟到过截止）
+	DecisionPending   = "pending"   // 仍待确认：消息未投递或对侧断连，金额未知
+)
+
+// ErrPendingClaims 表示仍有金额未知的领取决定，不能把未知金额同时作为可退余额。
+var ErrPendingClaims = errors.New("unresolved claim decisions: unknown amount is not refundable")
+
 type Instance struct {
 	ID       string          `json:"id"`
 	Sender   string          `json:"sender"`
@@ -47,6 +59,9 @@ type ClaimDecision struct {
 	Amount    uint64 `json:"amount"`
 	MessageID string `json:"message_id"`
 	Confirmed bool   `json:"confirmed"`
+	SideA     string `json:"side_a,omitempty"`
+	SideB     string `json:"side_b,omitempty"`
+	Note      string `json:"note,omitempty"`
 }
 
 type Coordinator struct {
@@ -116,6 +131,9 @@ func (c *Coordinator) Reconcile(id string) (*Instance, error) {
 	switch {
 	case claimedCount == 2:
 		inst.Stage = StageClaimed
+	case refundedCount+refundedAfterPartial == 2:
+		// 两侧都已退回（可能含部分领取记录）：整笔结束，金额由各自账本记录佐证。
+		inst.Stage = StageRefunded
 	case refundedCount == 2:
 		inst.Stage = StageRefunded
 	case claimedCount+partialCount+refundedAfterPartial > 0 && refundedCount+refundedAfterPartial > 0:
@@ -195,7 +213,9 @@ func (c *Coordinator) DecideClaim(id string, amount uint64) (*ClaimDecision, err
 }
 
 // SyncClaims 重启后追查已决定的领取：用原消息 ID 重发（网络与节点均按 ID 去重），
-// 并从实际账本读取已确认总额更新决定状态，不产生第二笔效果。
+// 并逐侧核对实际账本，把每个决定区分为已发生（confirmed）、明确拒绝（rejected）
+// 或仍待确认（pending）。已过截止才投递的领取被账本拒绝，记为可解释的迟到拒绝，
+// 不会永久卡在未知。重发不产生第二笔效果。
 func (c *Coordinator) SyncClaims(id string) error {
 	c.mu.Lock()
 	inst := c.instances[id]
@@ -206,21 +226,69 @@ func (c *Coordinator) SyncClaims(id string) error {
 	for _, decision := range inst.Claims {
 		c.sendClaimMessages(inst, decision)
 	}
-	escrow, err := c.b.Status(escrowID(id, "b"))
-	if err != nil {
-		return err
-	}
-	confirmed := map[string]bool{}
-	for _, record := range escrow.Claims {
-		confirmed[record.ClaimID] = true
-	}
 	c.mu.Lock()
 	for i := range inst.Claims {
-		inst.Claims[i].Confirmed = confirmed[inst.Claims[i].ClaimID]
+		c.classifyDecisionLocked(inst, &inst.Claims[i])
 	}
-	err = c.saveLocked()
+	err := c.saveLocked()
 	c.mu.Unlock()
 	return err
+}
+
+// classifyDecisionLocked 按原 claim_id 核对单侧事实：账本有记录即已发生；
+// 消息已投递但账本无记录即被明确拒绝；否则仍待确认。
+func (c *Coordinator) classifyDecisionLocked(inst *Instance, decision *ClaimDecision) {
+	decision.Note = ""
+	for _, side := range []string{"a", "b"} {
+		l := c.a
+		if side == "b" {
+			l = c.b
+		}
+		status := DecisionPending
+		if escrow, err := l.Status(escrowID(inst.ID, side)); err == nil {
+			found := false
+			for _, record := range escrow.Claims {
+				if record.ClaimID == decision.ClaimID {
+					found = true
+					break
+				}
+			}
+			switch {
+			case found:
+				status = DecisionConfirmed
+			case func() bool { d, known := c.net.Delivered(decision.MessageID + "-" + side); return known && d }():
+				status = DecisionRejected
+				if !l.Now().Before(escrow.Deadline) {
+					decision.Note = "迟到拒绝：" + side + " 侧投递时已过本地截止，金额 " + strconv.FormatUint(decision.Amount, 10) + " 未在该侧落账"
+				} else {
+					decision.Note = side + " 侧账本拒绝了该领取决定"
+				}
+			}
+		}
+		if side == "a" {
+			decision.SideA = status
+		} else {
+			decision.SideB = status
+		}
+	}
+	decision.Confirmed = decision.SideB == DecisionConfirmed
+}
+
+// PendingClaimAmount 返回仍待确认（未知）的领取金额；退款前必须降到 0。
+func (c *Coordinator) PendingClaimAmount(id string) (uint64, error) {
+	c.mu.Lock()
+	inst := c.instances[id]
+	c.mu.Unlock()
+	if inst == nil {
+		return 0, ledger.ErrMissing
+	}
+	var pending uint64
+	for _, decision := range inst.Claims {
+		if decision.SideA == DecisionPending || decision.SideB == DecisionPending || decision.SideA == "" || decision.SideB == "" {
+			pending += decision.Amount
+		}
+	}
+	return pending, nil
 }
 
 func (c *Coordinator) sendClaimMessages(inst *Instance, decision ClaimDecision) {
@@ -236,6 +304,18 @@ func (c *Coordinator) RefundExpired(id string) error {
 	c.mu.Unlock()
 	if inst == nil || !c.clock.Now().After(inst.Deadline) {
 		return ledger.ErrDeadlineNotPassed
+	}
+	// 退款前先处理尚未确定的领取决定：用原编号重发并逐侧核对，
+	// 仍有未知金额时拒绝退款，不能把未知金额同时作为可退余额。
+	if err := c.SyncClaims(id); err != nil {
+		return err
+	}
+	pending, err := c.PendingClaimAmount(id)
+	if err != nil {
+		return err
+	}
+	if pending > 0 {
+		return fmt.Errorf("%w: %d 仍待确认", ErrPendingClaims, pending)
 	}
 	for _, side := range []string{"a", "b"} {
 		if _, err := c.net.Send("coordinator", "ledger-"+side, message.KindRefund, node.IDPayload{EscrowID: escrowID(id, side)}, 10*time.Millisecond); err != nil {
@@ -271,12 +351,16 @@ type SideReport struct {
 
 // TransferReport 是协调者重新读取两侧实际账本后得到的逐笔对账结果。
 type TransferReport struct {
-	ID       string     `json:"id"`
-	Stage    string     `json:"stage"`
-	Amount   uint64     `json:"amount"`
-	Deadline time.Time  `json:"deadline"`
-	A        SideReport `json:"a"`
-	B        SideReport `json:"b"`
+	ID         string          `json:"id"`
+	Stage      string          `json:"stage"`
+	Amount     uint64          `json:"amount"`
+	Deadline   time.Time       `json:"deadline"`
+	A          SideReport      `json:"a"`
+	B          SideReport      `json:"b"`
+	Decisions  []ClaimDecision `json:"decisions,omitempty"`
+	Pending    uint64          `json:"pending_unknown"`
+	ConservedA bool            `json:"conserved_a"`
+	ConservedB bool            `json:"conserved_b"`
 }
 
 func sideReport(l *ledger.Ledger, escrowID string) SideReport {
@@ -318,20 +402,42 @@ func (c *Coordinator) Audit() ([]TransferReport, error) {
 	sort.Strings(ids)
 	reports := make([]TransferReport, 0, len(ids))
 	for _, id := range ids {
+		// 对账前先按原编号核对每个领取决定的两侧事实，不凭过期日志下结论。
+		if err := c.SyncClaims(id); err != nil {
+			return nil, err
+		}
 		inst, err := c.Reconcile(id)
 		if err != nil {
 			return nil, err
 		}
-		reports = append(reports, TransferReport{
-			ID:       inst.ID,
-			Stage:    inst.Stage,
-			Amount:   inst.Amount,
-			Deadline: inst.Deadline,
-			A:        sideReport(c.a, escrowID(id, "a")),
-			B:        sideReport(c.b, escrowID(id, "b")),
-		})
+		report := TransferReport{
+			ID:         inst.ID,
+			Stage:      inst.Stage,
+			Amount:     inst.Amount,
+			Deadline:   inst.Deadline,
+			A:          sideReport(c.a, escrowID(id, "a")),
+			B:          sideReport(c.b, escrowID(id, "b")),
+			Decisions:  append([]ClaimDecision(nil), inst.Claims...),
+			ConservedA: sideConserved(c.a, escrowID(id, "a"), inst.Amount),
+			ConservedB: sideConserved(c.b, escrowID(id, "b"), inst.Amount),
+		}
+		for _, decision := range inst.Claims {
+			if decision.SideA == DecisionPending || decision.SideB == DecisionPending {
+				report.Pending += decision.Amount
+			}
+		}
+		reports = append(reports, report)
 	}
 	return reports, nil
+}
+
+// sideConserved 核对单侧账本：已确认 + 已退回 + 仍锁定 = 转移总额（无锁则无需核对）。
+func sideConserved(l *ledger.Ledger, id string, amount uint64) bool {
+	escrow, err := l.Status(id)
+	if err != nil {
+		return true
+	}
+	return escrow.ClaimedAmount+escrow.RefundedAmount+escrow.Remaining() == amount
 }
 
 func (c *Coordinator) SetClockOffsets(offsetA, offsetB time.Duration) {

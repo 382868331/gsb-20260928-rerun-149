@@ -96,6 +96,77 @@ func main() {
 	printAudit(rt)
 	printConservation(rt)
 	fmt.Println("本演练只使用虚拟余额与模拟时钟，不接入任何真实账本或资产")
+	runFollowup(*dir+"-followup", start)
+}
+
+// 故障交错演练：600 的转移先领取 170，第二次 220 只在 B 侧落账、A 侧断连；
+// 协调者重开并越过截止，退款前必须先处理尚未确定的领取决定。
+func runFollowup(dir string, start time.Time) {
+	fmt.Println("--- 故障交错演练（独立数据目录）：demo-6=600，先领 170，再领 220 时 A 侧断连 ---")
+	rt, err := lab.NewRuntime(dir, start, 0, 0)
+	must(err)
+	mustBegin(rt, "demo-6", 600, time.Hour)
+	advance(rt, 40*time.Millisecond)
+
+	fmt.Println("第一次领取 170：两侧都确认")
+	_, err = rt.Coordinator.DecideClaim("demo-6", 170)
+	must(err)
+	advance(rt, 40*time.Millisecond)
+	printSettlement(rt, "demo-6")
+
+	fmt.Println("断开 ledger-a，第二次领取 220：只在 B 侧落账，A 侧响应丢失")
+	rt.Network.SetDisconnected("ledger-a", true)
+	_, err = rt.Coordinator.DecideClaim("demo-6", 220)
+	must(err)
+	advance(rt, 40*time.Millisecond)
+	printSettlement(rt, "demo-6")
+
+	fmt.Println("协调者失联重开并越过截止；A 侧仍断连时 220 金额未知，退款必须被拒绝")
+	rt, err = lab.RestartRuntime(dir, rt.RefClock.Now(), 0, 0)
+	must(err)
+	rt.Network.SetDisconnected("ledger-a", true)
+	advance(rt, time.Hour+time.Minute)
+	if err := rt.Coordinator.RefundExpired("demo-6"); err != nil {
+		fmt.Printf("退款被拒绝：%v（未知金额不能同时作为可退余额）\n", err)
+	}
+	printSettlement(rt, "demo-6")
+
+	fmt.Println("恢复 A 连接：用原领取编号重发，A 侧收到迟到的 220 领取，已过截止被明确拒绝")
+	rt.Network.SetDisconnected("ledger-a", false)
+	rt.Network.RestoreDisconnected()
+	must(rt.Coordinator.SyncClaims("demo-6"))
+	advance(rt, 40*time.Millisecond)
+	must(rt.Coordinator.SyncClaims("demo-6"))
+	printSettlement(rt, "demo-6")
+
+	fmt.Println("未知金额已清零，执行到期退回：A 退 430，B 退 210，各自与已领部分相加均为 600")
+	must(rt.Coordinator.RefundExpired("demo-6"))
+	advance(rt, 40*time.Millisecond)
+	printSettlement(rt, "demo-6")
+	printAudit(rt)
+	printConservation(rt)
+}
+
+// printSettlement 逐步核对某笔转移的已领、待定、可退与锁定金额。
+func printSettlement(rt *lab.Runtime, id string) {
+	reports, err := rt.Coordinator.Audit()
+	must(err)
+	for _, report := range reports {
+		if report.ID != id {
+			continue
+		}
+		fmt.Printf("%s 阶段=%s 待定(未知)=%d 守恒A=%v 守恒B=%v\n", report.ID, report.Stage, report.Pending, report.ConservedA, report.ConservedB)
+		fmt.Printf("  A侧 已领=%d 已退=%d 仍锁=%d；B侧 已领=%d 已退=%d 仍锁=%d\n",
+			report.A.Confirmed, report.A.Refunded, report.A.Locked,
+			report.B.Confirmed, report.B.Refunded, report.B.Locked)
+		for _, d := range report.Decisions {
+			note := d.Note
+			if note == "" {
+				note = "-"
+			}
+			fmt.Printf("  决定 %s 金额=%d A侧=%s B侧=%s 说明=%s\n", d.ClaimID, d.Amount, d.SideA, d.SideB, note)
+		}
+	}
 }
 
 func printClaims(rt *lab.Runtime, id string) {
