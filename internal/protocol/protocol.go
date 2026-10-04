@@ -26,6 +26,14 @@ const (
 	StagePartiallyRefunded = "partially_refunded"
 	StageRefunded          = "refunded"
 	StageMixedExpired      = "mixed_expired"
+	StageClaimConflict     = "claim_conflict"
+)
+
+const (
+	ClaimStatePending   = "pending"
+	ClaimStateConfirmed = "confirmed"
+	ClaimStateRejected  = "rejected"
+	ClaimStateConflict  = "conflict"
 )
 
 type Instance struct {
@@ -46,7 +54,12 @@ type ClaimDecision struct {
 	ClaimID   string `json:"claim_id"`
 	Amount    uint64 `json:"amount"`
 	MessageID string `json:"message_id"`
+	State     string `json:"state"`
 	Confirmed bool   `json:"confirmed"`
+	AState    string `json:"a_state"`
+	BState    string `json:"b_state"`
+	AReason   string `json:"a_reason,omitempty"`
+	BReason   string `json:"b_reason,omitempty"`
 }
 
 type Coordinator struct {
@@ -112,19 +125,34 @@ func (c *Coordinator) Reconcile(id string) (*Instance, error) {
 	claimedCount := statuses[ledger.StatusClaimed]
 	refundedCount := statuses[ledger.StatusRefunded]
 	partialCount := statuses[ledger.StatusPartiallyClaimed]
+	partialRefundCount := statuses[ledger.StatusPartiallyRefunded]
 	refundedAfterPartial := statuses["refunded_after_partial"]
+	refundedTotal := refundedCount + refundedAfterPartial
+	if err := c.SyncClaims(id); err != nil {
+		return nil, err
+	}
+	hasConflict := false
+	for _, decision := range inst.Claims {
+		if decision.State == ClaimStateConflict {
+			hasConflict = true
+		}
+	}
 	switch {
+	case hasConflict:
+		inst.Stage = StageClaimConflict
 	case claimedCount == 2:
 		inst.Stage = StageClaimed
-	case refundedCount == 2:
+	case refundedTotal == 2:
 		inst.Stage = StageRefunded
 	case claimedCount+partialCount+refundedAfterPartial > 0 && refundedCount+refundedAfterPartial > 0:
 		inst.Stage = StageMixedExpired
+	case lockedCount+partialCount+partialRefundCount > 0 && refundedCount+partialRefundCount > 0:
+		inst.Stage = StagePartiallyRefunded
 	case lockedCount == 2:
 		inst.Stage = StageLocked
 	case claimedCount+partialCount > 0:
 		inst.Stage = StagePartiallyClaimed
-	case refundedCount > 0:
+	case refundedCount+partialRefundCount > 0:
 		inst.Stage = StagePartiallyRefunded
 	case lockedCount > 0:
 		inst.Stage = StagePartiallyLocked
@@ -171,16 +199,42 @@ func (c *Coordinator) DecideClaim(id string, amount uint64) (*ClaimDecision, err
 	if amount == 0 {
 		return nil, ledger.ErrInvalidAmount
 	}
-	escrow, err := c.b.Status(escrowID(id, "b"))
-	if err != nil {
-		return nil, err
+	aEscrow, aErr := c.a.Status(escrowID(id, "a"))
+	bEscrow, bErr := c.b.Status(escrowID(id, "b"))
+	if aErr != nil {
+		return nil, aErr
 	}
-	if amount > escrow.Remaining() {
+	if bErr != nil {
+		return nil, bErr
+	}
+	reservedA := uint64(0)
+	reservedB := uint64(0)
+	for _, existing := range inst.Claims {
+		if existing.State == ClaimStateConflict {
+			return nil, ledger.ErrConflictingClaim
+		}
+		if existing.State == ClaimStatePending {
+			if existing.AState != ClaimStateConfirmed {
+				reservedA = saturatingAdd(reservedA, existing.Amount)
+			}
+			if existing.BState != ClaimStateConfirmed {
+				reservedB = saturatingAdd(reservedB, existing.Amount)
+			}
+		}
+	}
+	remaining := subtractAvailable(aEscrow.Remaining(), reservedA)
+	if bAvailable := subtractAvailable(bEscrow.Remaining(), reservedB); bAvailable < remaining {
+		remaining = bAvailable
+	}
+	if amount > remaining {
 		return nil, ledger.ErrInvalidAmount
 	}
 	decision := ClaimDecision{
 		ClaimID: id + "-claim-" + strconv.Itoa(len(inst.Claims)+1),
 		Amount:  amount,
+		State:   ClaimStatePending,
+		AState:  ClaimStatePending,
+		BState:  ClaimStatePending,
 	}
 	decision.MessageID = decision.ClaimID + "-msg"
 	c.mu.Lock()
@@ -194,8 +248,22 @@ func (c *Coordinator) DecideClaim(id string, amount uint64) (*ClaimDecision, err
 	return &decision, nil
 }
 
-// SyncClaims 重启后追查已决定的领取：用原消息 ID 重发（网络与节点均按 ID 去重），
-// 并从实际账本读取已确认总额更新决定状态，不产生第二笔效果。
+func saturatingAdd(a, b uint64) uint64 {
+	if a > ^uint64(0)-b {
+		return ^uint64(0)
+	}
+	return a + b
+}
+
+func subtractAvailable(remaining, reserved uint64) uint64 {
+	if reserved >= remaining {
+		return 0
+	}
+	return remaining - reserved
+}
+
+// SyncClaims 用原消息 ID 追查每个领取决定在两侧账本上的事实：
+// 已确认、明确拒绝和仍待确认分别落账；重发由网络和节点幂等去重。
 func (c *Coordinator) SyncClaims(id string) error {
 	c.mu.Lock()
 	inst := c.instances[id]
@@ -206,21 +274,51 @@ func (c *Coordinator) SyncClaims(id string) error {
 	for _, decision := range inst.Claims {
 		c.sendClaimMessages(inst, decision)
 	}
-	escrow, err := c.b.Status(escrowID(id, "b"))
-	if err != nil {
-		return err
-	}
-	confirmed := map[string]bool{}
-	for _, record := range escrow.Claims {
-		confirmed[record.ClaimID] = true
-	}
+	aEscrow, aErr := c.a.Status(escrowID(id, "a"))
+	bEscrow, bErr := c.b.Status(escrowID(id, "b"))
 	c.mu.Lock()
 	for i := range inst.Claims {
-		inst.Claims[i].Confirmed = confirmed[inst.Claims[i].ClaimID]
+		aState, aReason := claimFact(aEscrow, aErr, inst.Claims[i].ClaimID)
+		bState, bReason := claimFact(bEscrow, bErr, inst.Claims[i].ClaimID)
+		inst.Claims[i].AState = aState
+		inst.Claims[i].BState = bState
+		inst.Claims[i].AReason = aReason
+		inst.Claims[i].BReason = bReason
+		switch {
+		case aState == ClaimStateConfirmed && bState == ClaimStateConfirmed:
+			inst.Claims[i].State = ClaimStateConfirmed
+		case aState == ClaimStateRejected && bState == ClaimStateRejected:
+			inst.Claims[i].State = ClaimStateRejected
+		case aState == ClaimStateConfirmed && bState == ClaimStateRejected,
+			aState == ClaimStateRejected && bState == ClaimStateConfirmed:
+			inst.Claims[i].State = ClaimStateConflict
+		default:
+			inst.Claims[i].State = ClaimStatePending
+		}
+		inst.Claims[i].Confirmed = inst.Claims[i].State == ClaimStateConfirmed
 	}
-	err = c.saveLocked()
+	err := c.saveLocked()
 	c.mu.Unlock()
 	return err
+}
+
+func claimFact(escrow *ledger.Escrow, statusErr error, claimID string) (string, string) {
+	if statusErr != nil || escrow == nil {
+		return ClaimStatePending, ""
+	}
+	switch escrow.ClaimState(claimID) {
+	case ClaimStateConfirmed:
+		return ClaimStateConfirmed, ""
+	case ClaimStateRejected:
+		for _, rejected := range escrow.RejectedClaims {
+			if rejected.ClaimID == claimID {
+				return ClaimStateRejected, rejected.Reason
+			}
+		}
+		return ClaimStateRejected, "rejected"
+	default:
+		return ClaimStatePending, ""
+	}
 }
 
 func (c *Coordinator) sendClaimMessages(inst *Instance, decision ClaimDecision) {
@@ -234,13 +332,63 @@ func (c *Coordinator) RefundExpired(id string) error {
 	c.mu.Lock()
 	inst := c.instances[id]
 	c.mu.Unlock()
-	if inst == nil || !c.clock.Now().After(inst.Deadline) {
+	if inst == nil {
+		return ledger.ErrMissing
+	}
+	if err := c.SyncClaims(id); err != nil {
+		return err
+	}
+	if !c.clock.Now().After(inst.Deadline) {
 		return ledger.ErrDeadlineNotPassed
 	}
+	aEscrow, aErr := c.a.Status(escrowID(id, "a"))
+	bEscrow, bErr := c.b.Status(escrowID(id, "b"))
+	for _, decision := range inst.Claims {
+		if decision.State == ClaimStatePending &&
+			((aErr == nil && decision.AState != ClaimStateConfirmed) || (bErr == nil && decision.BState != ClaimStateConfirmed)) {
+			return ledger.ErrPendingClaim
+		}
+	}
+	refund := map[string]uint64{}
+	hasConflict := false
+	if aErr == nil {
+		refund["a"] = aEscrow.Remaining()
+	}
+	if bErr == nil {
+		refund["b"] = bEscrow.Remaining()
+	}
+	for _, decision := range inst.Claims {
+		switch decision.State {
+		case ClaimStatePending:
+			return ledger.ErrPendingClaim
+		case ClaimStateConflict:
+			hasConflict = true
+			if decision.AState != ClaimStateConfirmed && decision.Amount <= refund["a"] {
+				refund["a"] -= decision.Amount
+			}
+			if decision.BState != ClaimStateConfirmed && decision.Amount <= refund["b"] {
+				refund["b"] -= decision.Amount
+			}
+		case ClaimStateRejected:
+			// 双方都明确拒绝时，该金额仍包含在各侧 Remaining 中，应正常退回。
+		}
+	}
 	for _, side := range []string{"a", "b"} {
-		if _, err := c.net.Send("coordinator", "ledger-"+side, message.KindRefund, node.IDPayload{EscrowID: escrowID(id, side)}, 10*time.Millisecond); err != nil {
+		if _, ok := refund[side]; !ok {
+			continue
+		}
+		payload := node.IDPayload{EscrowID: escrowID(id, side), Amount: refund[side]}
+		messageID := id + "-refund-" + side
+		if _, err := c.net.SendWithID(messageID, "coordinator", "ledger-"+side, message.KindRefund, payload, 10*time.Millisecond); err != nil {
 			return err
 		}
+	}
+	return returnConflict(hasConflict)
+}
+
+func returnConflict(hasConflict bool) error {
+	if hasConflict {
+		return ledger.ErrConflictingClaim
 	}
 	return nil
 }
@@ -259,14 +407,18 @@ func (c *Coordinator) Get(id string) (*Instance, error) {
 
 // SideReport 描述某笔转移在单侧账本上的资金占用与可执行动作。
 type SideReport struct {
-	EscrowID  string               `json:"escrow_id"`
-	Status    string               `json:"status"`
-	Locked    uint64               `json:"locked"`
-	Confirmed uint64               `json:"confirmed_total"`
-	Claims    []ledger.ClaimRecord `json:"claims,omitempty"`
-	Refunded  uint64               `json:"refunded_amount,omitempty"`
-	Deadline  time.Time            `json:"deadline"`
-	Actions   []string             `json:"actions"`
+	EscrowID       string                 `json:"escrow_id"`
+	Status         string                 `json:"status"`
+	Locked         uint64                 `json:"locked"`
+	Confirmed      uint64                 `json:"confirmed_total"`
+	Pending        uint64                 `json:"pending_total"`
+	Disputed       uint64                 `json:"disputed_total"`
+	Refundable     uint64                 `json:"refundable_total"`
+	Claims         []ledger.ClaimRecord   `json:"claims,omitempty"`
+	RejectedClaims []ledger.RejectedClaim `json:"rejected_claims,omitempty"`
+	Refunded       uint64                 `json:"refunded_amount,omitempty"`
+	Deadline       time.Time              `json:"deadline"`
+	Actions        []string               `json:"actions"`
 }
 
 // TransferReport 是协调者重新读取两侧实际账本后得到的逐笔对账结果。
@@ -279,7 +431,7 @@ type TransferReport struct {
 	B        SideReport `json:"b"`
 }
 
-func sideReport(l *ledger.Ledger, escrowID string) SideReport {
+func sideReport(inst *Instance, side string, l *ledger.Ledger, escrowID string) SideReport {
 	report := SideReport{EscrowID: escrowID, Status: "missing"}
 	escrow, err := l.Status(escrowID)
 	if err != nil {
@@ -289,16 +441,44 @@ func sideReport(l *ledger.Ledger, escrowID string) SideReport {
 	report.Status = escrow.Status
 	report.Deadline = escrow.Deadline
 	report.Confirmed = escrow.ClaimedAmount
+	report.Locked = escrow.Remaining()
 	report.Claims = escrow.Claims
+	report.RejectedClaims = escrow.RejectedClaims
 	report.Refunded = escrow.RefundedAmount
+	sideState := func(decision ClaimDecision) string {
+		if side == "a" {
+			return decision.AState
+		}
+		return decision.BState
+	}
+	for _, decision := range inst.Claims {
+		switch decision.State {
+		case ClaimStatePending:
+			if sideState(decision) != ClaimStateConfirmed {
+				report.Pending += decision.Amount
+			}
+		case ClaimStateConflict:
+			if sideState(decision) != ClaimStateConfirmed {
+				report.Disputed += decision.Amount
+			}
+		}
+	}
+	report.Refundable = report.Locked
+	if report.Pending+report.Disputed >= report.Refundable {
+		report.Refundable = 0
+	} else {
+		report.Refundable -= report.Pending + report.Disputed
+	}
 	now := l.Now()
 	switch escrow.Status {
-	case ledger.StatusLocked, ledger.StatusPartiallyClaimed:
-		report.Locked = escrow.Remaining()
-		if now.Before(escrow.Deadline) {
-			report.Actions = append(report.Actions, "claim:提交 secret 分次或全额领取，本地截止 "+escrow.Deadline.Format(time.RFC3339))
+	case ledger.StatusLocked, ledger.StatusPartiallyClaimed, ledger.StatusPartiallyRefunded:
+		if escrow.Status == ledger.StatusPartiallyRefunded || !now.Before(escrow.Deadline) {
+			report.Actions = append(report.Actions, "refund:已过本地截止，可退回 "+strconv.FormatUint(report.Refundable, 10))
+			if report.Pending > 0 || report.Disputed > 0 {
+				report.Actions = append(report.Actions, "待确认锁定 "+strconv.FormatUint(report.Pending, 10)+"，争议锁定 "+strconv.FormatUint(report.Disputed, 10))
+			}
 		} else {
-			report.Actions = append(report.Actions, "refund:已过本地截止，可退回剩余 "+strconv.FormatUint(report.Locked, 10))
+			report.Actions = append(report.Actions, "claim:提交 secret 分次或全额领取，本地截止 "+escrow.Deadline.Format(time.RFC3339))
 		}
 	case ledger.StatusClaimed, ledger.StatusRefunded:
 		report.Actions = append(report.Actions, "终态 "+escrow.Status+"，不可再领取或退回")
@@ -327,8 +507,8 @@ func (c *Coordinator) Audit() ([]TransferReport, error) {
 			Stage:    inst.Stage,
 			Amount:   inst.Amount,
 			Deadline: inst.Deadline,
-			A:        sideReport(c.a, escrowID(id, "a")),
-			B:        sideReport(c.b, escrowID(id, "b")),
+			A:        sideReport(inst, "a", c.a, escrowID(id, "a")),
+			B:        sideReport(inst, "b", c.b, escrowID(id, "b")),
 		})
 	}
 	return reports, nil

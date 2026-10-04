@@ -1,6 +1,7 @@
 package lab
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -15,6 +16,131 @@ func lockEscrow(t *testing.T, rt *Runtime, id string, amount uint64, deadline ti
 		t.Fatal(err)
 	}
 	return secret
+}
+
+func TestPendingClaimBlocksRefundAndLateRejectionRemainsExplainable(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	rt, err := NewRuntime(dir, start, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Coordinator.Begin("uncertain-1", "alice", "bob", 600, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	advanceTest(rt, 40*time.Millisecond)
+
+	first, err := rt.Coordinator.DecideClaim("uncertain-1", 170)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceTest(rt, 40*time.Millisecond)
+
+	// 协调者未收到回应；重启后仍用原 claim ID 和消息 ID 追查。
+	rt, err = RestartRuntime(dir, rt.RefClock.Now(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Coordinator.SyncClaims("uncertain-1"); err != nil {
+		t.Fatal(err)
+	}
+	advanceTest(rt, 40*time.Millisecond)
+	inst, err := rt.Coordinator.Get("uncertain-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.Claims[0].State != protocol.ClaimStateConfirmed || inst.Claims[0].ClaimID != first.ClaimID {
+		t.Fatalf("first decision = %+v, want %s confirmed", inst.Claims[0], first.ClaimID)
+	}
+
+	// 第二次 220 只让 B 投递；A 的消息在断连期间积压。
+	second, err := rt.Coordinator.DecideClaim("uncertain-1", 220)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.Network.SetDisconnected("ledger-a", true)
+	advanceTest(rt, 40*time.Millisecond)
+
+	advanceTest(rt, time.Hour+time.Second)
+	rt, err = RestartRuntime(dir, rt.RefClock.Now(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.Network.SetDisconnected("ledger-a", true)
+	if err := rt.Coordinator.SyncClaims("uncertain-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Coordinator.RefundExpired("uncertain-1"); !errors.Is(err, ledger.ErrPendingClaim) {
+		t.Fatalf("refund pending err = %v, want ErrPendingClaim", err)
+	}
+
+	// 恢复后迟到的 A 领取被明确拒绝并持久化，不再永久停在未知。
+	rt.Network.SetDisconnected("ledger-a", false)
+	rt.Network.RestoreDisconnected()
+	records, err := rt.Network.Pump()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundDeadlineReject := false
+	for _, record := range records {
+		if record.Message.ID == second.MessageID+"-a" && errors.Is(record.Err, ledger.ErrDeadlinePassed) {
+			foundDeadlineReject = true
+		}
+	}
+	if !foundDeadlineReject {
+		t.Fatalf("records = %#v, want late A claim rejected by deadline", records)
+	}
+	if err := rt.Coordinator.SyncClaims("uncertain-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Coordinator.RefundExpired("uncertain-1"); !errors.Is(err, ledger.ErrConflictingClaim) {
+		t.Fatalf("refund conflict err = %v, want ErrConflictingClaim", err)
+	}
+
+	// 无争议的 210 两侧一致退回；220 单边领取保持争议锁定，不重复、不撤销。
+	advanceTest(rt, 40*time.Millisecond)
+	aEscrow, err := rt.LedgerA.Status(protocol.EscrowID("uncertain-1", "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bEscrow, err := rt.LedgerB.Status(protocol.EscrowID("uncertain-1", "b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aEscrow.ClaimedAmount != 170 || bEscrow.ClaimedAmount != 390 {
+		t.Fatalf("claimed A/B = %d/%d, want 170/390", aEscrow.ClaimedAmount, bEscrow.ClaimedAmount)
+	}
+	if aEscrow.RefundedAmount != 210 || bEscrow.RefundedAmount != 210 {
+		t.Fatalf("refunded A/B = %d/%d, want equal 210", aEscrow.RefundedAmount, bEscrow.RefundedAmount)
+	}
+	if aEscrow.Remaining() != 220 || bEscrow.Remaining() != 0 {
+		t.Fatalf("remaining A/B = %d/%d, want 220/0 disputed", aEscrow.Remaining(), bEscrow.Remaining())
+	}
+	if len(aEscrow.RejectedClaims) != 1 || aEscrow.RejectedClaims[0].ClaimID != second.ClaimID || aEscrow.RejectedClaims[0].Reason != "deadline_passed" {
+		t.Fatalf("A rejects = %+v, want %s deadline_passed", aEscrow.RejectedClaims, second.ClaimID)
+	}
+	reports, err := rt.Coordinator.Audit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report protocol.TransferReport
+	for _, candidate := range reports {
+		if candidate.ID == "uncertain-1" {
+			report = candidate
+		}
+	}
+	if report.Stage != protocol.StageClaimConflict {
+		t.Fatalf("stage = %s, want claim_conflict", report.Stage)
+	}
+	if report.A.Disputed != 220 || report.B.Disputed != 0 || report.A.Pending != 0 || report.B.Pending != 0 || report.A.Refundable != 0 || report.B.Refundable != 0 {
+		t.Fatalf("A/B report = %+v/%+v, want 220 disputed and no pending/refundable", report.A, report.B)
+	}
+	if total := rt.LedgerA.TotalBalance() + rt.LedgerA.LockedTotal(); total != 1000 {
+		t.Fatalf("A conservation = %d, want 1000", total)
+	}
+	if total := rt.LedgerB.TotalBalance() + rt.LedgerB.LockedTotal(); total != 1000 {
+		t.Fatalf("B conservation = %d, want 1000", total)
+	}
 }
 
 func TestPartialClaimsTraceableAndConserved(t *testing.T) {

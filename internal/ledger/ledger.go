@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	StatusLocked           = "locked"
-	StatusPartiallyClaimed = "partially_claimed"
-	StatusClaimed          = "claimed"
-	StatusRefunded         = "refunded"
+	StatusLocked            = "locked"
+	StatusPartiallyClaimed  = "partially_claimed"
+	StatusClaimed           = "claimed"
+	StatusPartiallyRefunded = "partially_refunded"
+	StatusRefunded          = "refunded"
 )
 
 var (
@@ -28,6 +29,8 @@ var (
 	ErrDeadlineNotPassed = errors.New("refund deadline has not passed")
 	ErrMissing           = errors.New("escrow missing")
 	ErrInvalidAmount     = errors.New("claim amount exceeds remaining locked balance")
+	ErrPendingClaim      = errors.New("claim decision is still pending")
+	ErrConflictingClaim  = errors.New("claim decision was accepted on one side and rejected on the other")
 )
 
 type Account struct {
@@ -36,19 +39,20 @@ type Account struct {
 }
 
 type Escrow struct {
-	ID             string        `json:"id"`
-	Transfer       string        `json:"transfer_id"`
-	From           string        `json:"from"`
-	To             string        `json:"to"`
-	Amount         uint64        `json:"amount"`
-	HashLock       []byte        `json:"hash_lock"`
-	Deadline       time.Time     `json:"deadline"`
-	Status         string        `json:"status"`
-	Secret         []byte        `json:"secret,omitempty"`
-	ClaimedAmount  uint64        `json:"claimed_amount"`
-	Claims         []ClaimRecord `json:"claims,omitempty"`
-	RefundedAmount uint64        `json:"refunded_amount,omitempty"`
-	UpdatedAt      time.Time     `json:"updated_at"`
+	ID             string          `json:"id"`
+	Transfer       string          `json:"transfer_id"`
+	From           string          `json:"from"`
+	To             string          `json:"to"`
+	Amount         uint64          `json:"amount"`
+	HashLock       []byte          `json:"hash_lock"`
+	Deadline       time.Time       `json:"deadline"`
+	Status         string          `json:"status"`
+	Secret         []byte          `json:"secret,omitempty"`
+	ClaimedAmount  uint64          `json:"claimed_amount"`
+	Claims         []ClaimRecord   `json:"claims,omitempty"`
+	RejectedClaims []RejectedClaim `json:"rejected_claims,omitempty"`
+	RefundedAmount uint64          `json:"refunded_amount,omitempty"`
+	UpdatedAt      time.Time       `json:"updated_at"`
 }
 
 // ClaimRecord 是一笔可追溯的分次领取记录：本次金额、已确认总额、仍不确定的剩余部分。
@@ -60,12 +64,33 @@ type ClaimRecord struct {
 	Time      time.Time `json:"time"`
 }
 
+type RejectedClaim struct {
+	ClaimID string    `json:"claim_id"`
+	Amount  uint64    `json:"amount"`
+	Reason  string    `json:"reason"`
+	Time    time.Time `json:"time"`
+}
+
 // Remaining 返回仍锁定、尚未领取也未退回的金额。
 func (e *Escrow) Remaining() uint64 {
 	if e.Status == StatusRefunded || e.Status == StatusClaimed {
 		return 0
 	}
-	return e.Amount - e.ClaimedAmount
+	return e.Amount - e.ClaimedAmount - e.RefundedAmount
+}
+
+func (e *Escrow) ClaimState(claimID string) string {
+	for _, claim := range e.Claims {
+		if claim.ClaimID == claimID {
+			return "confirmed"
+		}
+	}
+	for _, rejected := range e.RejectedClaims {
+		if rejected.ClaimID == claimID {
+			return "rejected"
+		}
+	}
+	return "pending"
 }
 
 type LockRequest struct {
@@ -191,27 +216,27 @@ func (l *Ledger) ClaimPartial(id string, secret []byte, claimID string, amount u
 			return cloneEscrow(escrow), &record, nil
 		}
 	}
-	if escrow.Status == StatusRefunded || escrow.Status == StatusClaimed {
-		return nil, nil, ErrAlreadyFinal
+	if escrow.Status == StatusRefunded || escrow.Status == StatusClaimed || escrow.Status == StatusPartiallyRefunded {
+		return l.rejectClaimLocked(escrow, claimID, amount, "already_refunded", ErrAlreadyFinal)
 	}
 	hash := sha256.Sum256(secret)
 	if !bytes.Equal(hash[:], escrow.HashLock) {
 		return nil, nil, ErrBadSecret
 	}
 	if !l.clock.Now().Before(escrow.Deadline) {
-		return nil, nil, ErrDeadlinePassed
+		return l.rejectClaimLocked(escrow, claimID, amount, "deadline_passed", ErrDeadlinePassed)
 	}
-	remaining := escrow.Amount - escrow.ClaimedAmount
+	remaining := escrow.Amount - escrow.ClaimedAmount - escrow.RefundedAmount
 	if amount == 0 {
 		amount = remaining
 	}
 	if amount > remaining {
-		return nil, nil, ErrInvalidAmount
+		return l.rejectClaimLocked(escrow, claimID, amount, "invalid_amount", ErrInvalidAmount)
 	}
 	to := l.accounts[escrow.To]
 	to.Balance += amount
 	escrow.ClaimedAmount += amount
-	record := ClaimRecord{ClaimID: claimID, Amount: amount, Confirmed: escrow.ClaimedAmount, Remaining: escrow.Amount - escrow.ClaimedAmount, Time: l.clock.Now()}
+	record := ClaimRecord{ClaimID: claimID, Amount: amount, Confirmed: escrow.ClaimedAmount, Remaining: escrow.Amount - escrow.ClaimedAmount - escrow.RefundedAmount, Time: l.clock.Now()}
 	escrow.Claims = append(escrow.Claims, record)
 	if escrow.ClaimedAmount == escrow.Amount {
 		escrow.Status = StatusClaimed
@@ -224,6 +249,10 @@ func (l *Ledger) ClaimPartial(id string, secret []byte, claimID string, amount u
 }
 
 func (l *Ledger) Refund(id string) (*Escrow, error) {
+	return l.RefundPartial(id, 0)
+}
+
+func (l *Ledger) RefundPartial(id string, amount uint64) (*Escrow, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	escrow := l.escrows[id]
@@ -239,13 +268,42 @@ func (l *Ledger) Refund(id string) (*Escrow, error) {
 	if l.clock.Now().Before(escrow.Deadline) {
 		return nil, ErrDeadlineNotPassed
 	}
-	remaining := escrow.Amount - escrow.ClaimedAmount
+	remaining := escrow.Amount - escrow.ClaimedAmount - escrow.RefundedAmount
+	if amount == 0 {
+		amount = remaining
+	}
+	if amount > remaining {
+		return nil, ErrInvalidAmount
+	}
 	from := l.accounts[escrow.From]
-	from.Balance += remaining
-	escrow.RefundedAmount = remaining
-	escrow.Status = StatusRefunded
+	from.Balance += amount
+	escrow.RefundedAmount += amount
+	if escrow.ClaimedAmount+escrow.RefundedAmount == escrow.Amount {
+		escrow.Status = StatusRefunded
+	} else {
+		escrow.Status = StatusPartiallyRefunded
+	}
 	escrow.UpdatedAt = l.clock.Now()
 	return cloneEscrow(escrow), l.saveLocked()
+}
+
+func (l *Ledger) rejectClaimLocked(escrow *Escrow, claimID string, amount uint64, reason string, cause error) (*Escrow, *ClaimRecord, error) {
+	for _, rejected := range escrow.RejectedClaims {
+		if rejected.ClaimID == claimID {
+			return cloneEscrow(escrow), nil, cause
+		}
+	}
+	escrow.RejectedClaims = append(escrow.RejectedClaims, RejectedClaim{
+		ClaimID: claimID,
+		Amount:  amount,
+		Reason:  reason,
+		Time:    l.clock.Now(),
+	})
+	escrow.UpdatedAt = l.clock.Now()
+	if err := l.saveLocked(); err != nil {
+		cause = errors.Join(cause, err)
+	}
+	return cloneEscrow(escrow), nil, cause
 }
 
 func (l *Ledger) Status(id string) (*Escrow, error) {
@@ -308,6 +366,7 @@ func cloneEscrow(in *Escrow) *Escrow {
 	out.HashLock = append([]byte(nil), in.HashLock...)
 	out.Secret = append([]byte(nil), in.Secret...)
 	out.Claims = append([]ClaimRecord(nil), in.Claims...)
+	out.RejectedClaims = append([]RejectedClaim(nil), in.RejectedClaims...)
 	return &out
 }
 

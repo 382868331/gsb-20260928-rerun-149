@@ -30,6 +30,7 @@ type SecretPayload struct {
 
 type IDPayload struct {
 	EscrowID string `json:"escrow_id"`
+	Amount   uint64 `json:"amount,omitempty"`
 }
 
 type AckPayload struct {
@@ -99,7 +100,7 @@ func (n *Node) Handle(msg message.Message) (*message.Message, error) {
 		p, err := message.Decode[IDPayload](msg)
 		if err == nil {
 			var escrow *ledger.Escrow
-			escrow, err = n.ledger.Refund(p.EscrowID)
+			escrow, err = n.ledger.RefundPartial(p.EscrowID, p.Amount)
 			if escrow != nil {
 				ack.Status = escrow.Status
 			}
