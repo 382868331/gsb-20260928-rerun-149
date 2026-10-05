@@ -36,6 +36,11 @@ const (
 	ClaimStateConflict  = "conflict"
 )
 
+// ResolutionRejectedSideRefunded 表示单侧确认、另一侧明确拒绝的争议已收尾：
+// 拒绝是终态事实（截止后不可再领取），拒绝侧仍锁住的争议金额随退款退回，
+// 确认侧的已领取事实保留不撤销。
+const ResolutionRejectedSideRefunded = "rejected_side_refunded"
+
 type Instance struct {
 	ID       string          `json:"id"`
 	Sender   string          `json:"sender"`
@@ -60,6 +65,8 @@ type ClaimDecision struct {
 	BState    string `json:"b_state"`
 	AReason   string `json:"a_reason,omitempty"`
 	BReason   string `json:"b_reason,omitempty"`
+	// Resolution 记录争议决定的收尾结果；空表示争议尚未处置。
+	Resolution string `json:"resolution,omitempty"`
 }
 
 type Coordinator struct {
@@ -133,7 +140,7 @@ func (c *Coordinator) Reconcile(id string) (*Instance, error) {
 	}
 	hasConflict := false
 	for _, decision := range inst.Claims {
-		if decision.State == ClaimStateConflict {
+		if decision.State == ClaimStateConflict && decision.Resolution == "" {
 			hasConflict = true
 		}
 	}
@@ -210,7 +217,7 @@ func (c *Coordinator) DecideClaim(id string, amount uint64) (*ClaimDecision, err
 	reservedA := uint64(0)
 	reservedB := uint64(0)
 	for _, existing := range inst.Claims {
-		if existing.State == ClaimStateConflict {
+		if existing.State == ClaimStateConflict && existing.Resolution == "" {
 			return nil, ledger.ErrConflictingClaim
 		}
 		if existing.State == ClaimStatePending {
@@ -350,7 +357,6 @@ func (c *Coordinator) RefundExpired(id string) error {
 		}
 	}
 	refund := map[string]uint64{}
-	hasConflict := false
 	if aErr == nil {
 		refund["a"] = aEscrow.Remaining()
 	}
@@ -362,13 +368,9 @@ func (c *Coordinator) RefundExpired(id string) error {
 		case ClaimStatePending:
 			return ledger.ErrPendingClaim
 		case ClaimStateConflict:
-			hasConflict = true
-			if decision.AState != ClaimStateConfirmed && decision.Amount <= refund["a"] {
-				refund["a"] -= decision.Amount
-			}
-			if decision.BState != ClaimStateConfirmed && decision.Amount <= refund["b"] {
-				refund["b"] -= decision.Amount
-			}
+			// 一侧确认、另一侧明确拒绝：拒绝是终态事实，不再当作未知；
+			// 拒绝侧仍锁住的争议金额已包含在 Remaining 中，随本次退款一并退回，
+			// 确认侧的已领取事实保留不撤销。
 		case ClaimStateRejected:
 			// 双方都明确拒绝时，该金额仍包含在各侧 Remaining 中，应正常退回。
 		}
@@ -383,14 +385,17 @@ func (c *Coordinator) RefundExpired(id string) error {
 			return err
 		}
 	}
-	return returnConflict(hasConflict)
-}
-
-func returnConflict(hasConflict bool) error {
-	if hasConflict {
-		return ledger.ErrConflictingClaim
+	// 退款消息已发出（确定性消息 ID，重发幂等），把争议决定标记为已收尾，
+	// 使原领取决定与其收尾结果都可查询，重开后保留终态和可解释的双方差异。
+	c.mu.Lock()
+	for i := range inst.Claims {
+		if inst.Claims[i].State == ClaimStateConflict && inst.Claims[i].Resolution == "" {
+			inst.Claims[i].Resolution = ResolutionRejectedSideRefunded
+		}
 	}
-	return nil
+	err := c.saveLocked()
+	c.mu.Unlock()
+	return err
 }
 
 func (c *Coordinator) Get(id string) (*Instance, error) {
@@ -454,11 +459,12 @@ func sideReport(inst *Instance, side string, l *ledger.Ledger, escrowID string) 
 	for _, decision := range inst.Claims {
 		switch decision.State {
 		case ClaimStatePending:
-			if sideState(decision) != ClaimStateConfirmed {
+			// 只把仍未知的一侧计入待定；已知拒绝是终态，不再当作未知。
+			if sideState(decision) == ClaimStatePending {
 				report.Pending += decision.Amount
 			}
 		case ClaimStateConflict:
-			if sideState(decision) != ClaimStateConfirmed {
+			if decision.Resolution == "" && sideState(decision) != ClaimStateConfirmed {
 				report.Disputed += decision.Amount
 			}
 		}
