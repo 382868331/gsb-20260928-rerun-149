@@ -93,11 +93,10 @@ func TestPendingClaimBlocksRefundAndLateRejectionRemainsExplainable(t *testing.T
 	if err := rt.Coordinator.SyncClaims("uncertain-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := rt.Coordinator.RefundExpired("uncertain-1"); !errors.Is(err, ledger.ErrConflictingClaim) {
-		t.Fatalf("refund conflict err = %v, want ErrConflictingClaim", err)
+	// 明确拒绝后再次退款：不再报冲突，争议 220 按 B 侧已确认事实在 A 侧收尾。
+	if err := rt.Coordinator.RefundExpired("uncertain-1"); err != nil {
+		t.Fatalf("refund after rejection err = %v, want nil（已知拒绝应可收尾）", err)
 	}
-
-	// 无争议的 210 两侧一致退回；220 单边领取保持争议锁定，不重复、不撤销。
 	advanceTest(rt, 40*time.Millisecond)
 	aEscrow, err := rt.LedgerA.Status(protocol.EscrowID("uncertain-1", "a"))
 	if err != nil {
@@ -107,17 +106,39 @@ func TestPendingClaimBlocksRefundAndLateRejectionRemainsExplainable(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if aEscrow.ClaimedAmount != 170 || bEscrow.ClaimedAmount != 390 {
-		t.Fatalf("claimed A/B = %d/%d, want 170/390", aEscrow.ClaimedAmount, bEscrow.ClaimedAmount)
+	// 各侧已领与退款合计均为 600：A 侧 170 领取 + 220 争议收尾 + 210 退回。
+	if aEscrow.ClaimedAmount != 390 || bEscrow.ClaimedAmount != 390 {
+		t.Fatalf("claimed A/B = %d/%d, want 390/390", aEscrow.ClaimedAmount, bEscrow.ClaimedAmount)
 	}
 	if aEscrow.RefundedAmount != 210 || bEscrow.RefundedAmount != 210 {
 		t.Fatalf("refunded A/B = %d/%d, want equal 210", aEscrow.RefundedAmount, bEscrow.RefundedAmount)
 	}
-	if aEscrow.Remaining() != 220 || bEscrow.Remaining() != 0 {
-		t.Fatalf("remaining A/B = %d/%d, want 220/0 disputed", aEscrow.Remaining(), bEscrow.Remaining())
+	if aEscrow.Remaining() != 0 || bEscrow.Remaining() != 0 {
+		t.Fatalf("remaining A/B = %d/%d, want 0/0（不留锁定）", aEscrow.Remaining(), bEscrow.Remaining())
 	}
+	// 单侧已领取事实与迟到拒绝都保留可查，收尾结果单独留痕。
 	if len(aEscrow.RejectedClaims) != 1 || aEscrow.RejectedClaims[0].ClaimID != second.ClaimID || aEscrow.RejectedClaims[0].Reason != "deadline_passed" {
 		t.Fatalf("A rejects = %+v, want %s deadline_passed", aEscrow.RejectedClaims, second.ClaimID)
+	}
+	if len(aEscrow.ResolvedClaims) != 1 || aEscrow.ResolvedClaims[0].ClaimID != second.ClaimID || aEscrow.ResolvedClaims[0].Amount != 220 {
+		t.Fatalf("A resolved = %+v, want %s 收尾 220", aEscrow.ResolvedClaims, second.ClaimID)
+	}
+	if len(bEscrow.ResolvedClaims) != 0 || len(bEscrow.RejectedClaims) != 0 {
+		t.Fatalf("B resolved/rejected = %+v/%+v, want 空（B 侧本就确认）", bEscrow.ResolvedClaims, bEscrow.RejectedClaims)
+	}
+	// 原领取决定与其收尾结果均可查询。
+	if err := rt.Coordinator.SyncClaims("uncertain-1"); err != nil {
+		t.Fatal(err)
+	}
+	inst, err = rt.Coordinator.Get("uncertain-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inst.Claims) != 2 || inst.Claims[0].State != protocol.ClaimStateConfirmed || inst.Claims[0].Amount != 170 {
+		t.Fatalf("claims = %+v, want 首笔 170 confirmed", inst.Claims)
+	}
+	if inst.Claims[1].State != protocol.ClaimStateConfirmed || inst.Claims[1].AReason != "resolved_after_deadline_passed" || inst.Claims[1].BReason != "" {
+		t.Fatalf("second decision = %+v, want confirmed 且 A 侧 resolved_after_deadline_passed", inst.Claims[1])
 	}
 	reports, err := rt.Coordinator.Audit()
 	if err != nil {
@@ -129,17 +150,73 @@ func TestPendingClaimBlocksRefundAndLateRejectionRemainsExplainable(t *testing.T
 			report = candidate
 		}
 	}
-	if report.Stage != protocol.StageClaimConflict {
-		t.Fatalf("stage = %s, want claim_conflict", report.Stage)
+	if report.Stage != protocol.StageRefunded {
+		t.Fatalf("stage = %s, want refunded（争议已收尾）", report.Stage)
 	}
-	if report.A.Disputed != 220 || report.B.Disputed != 0 || report.A.Pending != 0 || report.B.Pending != 0 || report.A.Refundable != 0 || report.B.Refundable != 0 {
-		t.Fatalf("A/B report = %+v/%+v, want 220 disputed and no pending/refundable", report.A, report.B)
+	if report.A.Disputed != 0 || report.B.Disputed != 0 || report.A.Pending != 0 || report.B.Pending != 0 || report.A.Refundable != 0 || report.B.Refundable != 0 {
+		t.Fatalf("A/B report = %+v/%+v, want 无 pending/disputed/refundable", report.A, report.B)
+	}
+	if len(report.A.ResolvedClaims) != 1 {
+		t.Fatalf("A report = %+v, want 无争议锁定且收尾记录可查", report.A)
+	}
+	// 已确认 170 不被重复领取：bob 与 treasury-a 各得 390，不多不少。
+	if got := rt.LedgerB.Balance("bob"); got != 390 {
+		t.Fatalf("bob = %d, want 390", got)
+	}
+	if got := rt.LedgerA.Balance("treasury-a"); got != 390 {
+		t.Fatalf("treasury-a = %d, want 390", got)
+	}
+	if got := rt.LedgerA.Balance("alice"); got != 610 {
+		t.Fatalf("alice = %d, want 610", got)
 	}
 	if total := rt.LedgerA.TotalBalance() + rt.LedgerA.LockedTotal(); total != 1000 {
 		t.Fatalf("A conservation = %d, want 1000", total)
 	}
 	if total := rt.LedgerB.TotalBalance() + rt.LedgerB.LockedTotal(); total != 1000 {
 		t.Fatalf("B conservation = %d, want 1000", total)
+	}
+
+	// 重复恢复与退款幂等：不再产生第二笔效果，也不再报冲突。
+	rt.Network.RestoreDisconnected()
+	if err := rt.Coordinator.RefundExpired("uncertain-1"); err != nil {
+		t.Fatalf("repeat refund err = %v, want nil（幂等）", err)
+	}
+	advanceTest(rt, 40*time.Millisecond)
+	if got := rt.LedgerA.Balance("alice"); got != 610 {
+		t.Fatalf("alice after repeat = %d, want 610", got)
+	}
+	if got := rt.LedgerB.Balance("bob"); got != 390 {
+		t.Fatalf("bob after repeat = %d, want 390", got)
+	}
+
+	// 重开后保留终态和可解释的双方差异。
+	rt, err = RestartRuntime(dir, rt.RefClock.Now(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst, err = rt.Coordinator.Get("uncertain-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.Stage != protocol.StageRefunded || len(inst.Claims) != 2 || inst.Claims[1].State != protocol.ClaimStateConfirmed {
+		t.Fatalf("restarted instance = %s/%+v, want refunded 终态与已收尾决定", inst.Stage, inst.Claims)
+	}
+	aEscrow, err = rt.LedgerA.Status(protocol.EscrowID("uncertain-1", "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aEscrow.RejectedClaims) != 1 || len(aEscrow.ResolvedClaims) != 1 || aEscrow.ClaimedAmount != 390 || aEscrow.RefundedAmount != 210 {
+		t.Fatalf("restarted A escrow = %+v, want 拒绝+收尾记录与 390/210", aEscrow)
+	}
+	if err := rt.Coordinator.RefundExpired("uncertain-1"); err != nil {
+		t.Fatalf("refund after restart err = %v, want nil", err)
+	}
+	advanceTest(rt, 40*time.Millisecond)
+	if total := rt.LedgerA.TotalBalance() + rt.LedgerA.LockedTotal(); total != 1000 {
+		t.Fatalf("A conservation after restart = %d, want 1000", total)
+	}
+	if total := rt.LedgerB.TotalBalance() + rt.LedgerB.LockedTotal(); total != 1000 {
+		t.Fatalf("B conservation after restart = %d, want 1000", total)
 	}
 }
 

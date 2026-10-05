@@ -308,6 +308,9 @@ func claimFact(escrow *ledger.Escrow, statusErr error, claimID string) (string, 
 	}
 	switch escrow.ClaimState(claimID) {
 	case ClaimStateConfirmed:
+		if resolved := escrow.ResolvedClaimByID(claimID); resolved != nil {
+			return ClaimStateConfirmed, "resolved_after_" + resolved.Reason
+		}
 		return ClaimStateConfirmed, ""
 	case ClaimStateRejected:
 		for _, rejected := range escrow.RejectedClaims {
@@ -350,19 +353,30 @@ func (c *Coordinator) RefundExpired(id string) error {
 		}
 	}
 	refund := map[string]uint64{}
-	hasConflict := false
 	if aErr == nil {
 		refund["a"] = aEscrow.Remaining()
 	}
 	if bErr == nil {
 		refund["b"] = bEscrow.Remaining()
 	}
+	type resolveTask struct {
+		side    string
+		claimID string
+	}
+	var resolves []resolveTask
 	for _, decision := range inst.Claims {
 		switch decision.State {
 		case ClaimStatePending:
 			return ledger.ErrPendingClaim
 		case ClaimStateConflict:
-			hasConflict = true
+			// 一侧已确认、另一侧已明确拒绝：拒绝不再是未知，按已确认事实
+			// 把拒绝侧的争议金额收尾给本侧收款人，其余无争议部分正常退回。
+			if decision.AState == ClaimStateRejected {
+				resolves = append(resolves, resolveTask{side: "a", claimID: decision.ClaimID})
+			}
+			if decision.BState == ClaimStateRejected {
+				resolves = append(resolves, resolveTask{side: "b", claimID: decision.ClaimID})
+			}
 			if decision.AState != ClaimStateConfirmed && decision.Amount <= refund["a"] {
 				refund["a"] -= decision.Amount
 			}
@@ -383,12 +397,12 @@ func (c *Coordinator) RefundExpired(id string) error {
 			return err
 		}
 	}
-	return returnConflict(hasConflict)
-}
-
-func returnConflict(hasConflict bool) error {
-	if hasConflict {
-		return ledger.ErrConflictingClaim
+	for _, task := range resolves {
+		payload := node.ResolvePayload{EscrowID: escrowID(id, task.side), ClaimID: task.claimID}
+		messageID := id + "-resolve-" + task.claimID + "-" + task.side
+		if _, err := c.net.SendWithID(messageID, "coordinator", "ledger-"+task.side, message.KindResolve, payload, 10*time.Millisecond); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -416,6 +430,7 @@ type SideReport struct {
 	Refundable     uint64                 `json:"refundable_total"`
 	Claims         []ledger.ClaimRecord   `json:"claims,omitempty"`
 	RejectedClaims []ledger.RejectedClaim `json:"rejected_claims,omitempty"`
+	ResolvedClaims []ledger.ResolvedClaim `json:"resolved_claims,omitempty"`
 	Refunded       uint64                 `json:"refunded_amount,omitempty"`
 	Deadline       time.Time              `json:"deadline"`
 	Actions        []string               `json:"actions"`
@@ -444,6 +459,7 @@ func sideReport(inst *Instance, side string, l *ledger.Ledger, escrowID string) 
 	report.Locked = escrow.Remaining()
 	report.Claims = escrow.Claims
 	report.RejectedClaims = escrow.RejectedClaims
+	report.ResolvedClaims = escrow.ResolvedClaims
 	report.Refunded = escrow.RefundedAmount
 	sideState := func(decision ClaimDecision) string {
 		if side == "a" {

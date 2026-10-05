@@ -51,6 +51,7 @@ type Escrow struct {
 	ClaimedAmount  uint64          `json:"claimed_amount"`
 	Claims         []ClaimRecord   `json:"claims,omitempty"`
 	RejectedClaims []RejectedClaim `json:"rejected_claims,omitempty"`
+	ResolvedClaims []ResolvedClaim `json:"resolved_claims,omitempty"`
 	RefundedAmount uint64          `json:"refunded_amount,omitempty"`
 	UpdatedAt      time.Time       `json:"updated_at"`
 }
@@ -65,6 +66,15 @@ type ClaimRecord struct {
 }
 
 type RejectedClaim struct {
+	ClaimID string    `json:"claim_id"`
+	Amount  uint64    `json:"amount"`
+	Reason  string    `json:"reason"`
+	Time    time.Time `json:"time"`
+}
+
+// ResolvedClaim 是一笔已明确拒绝、随后按对侧已确认事实收尾的争议金额：
+// 拒绝记录保留可查，收尾结果单独留痕，不删除任何一侧历史来制造一致。
+type ResolvedClaim struct {
 	ClaimID string    `json:"claim_id"`
 	Amount  uint64    `json:"amount"`
 	Reason  string    `json:"reason"`
@@ -252,6 +262,65 @@ func (l *Ledger) Refund(id string) (*Escrow, error) {
 	return l.RefundPartial(id, 0)
 }
 
+// ResolvedClaimByID 返回某笔已收尾的争议领取记录，未收尾时返回 nil。
+func (e *Escrow) ResolvedClaimByID(claimID string) *ResolvedClaim {
+	for i := range e.ResolvedClaims {
+		if e.ResolvedClaims[i].ClaimID == claimID {
+			resolved := e.ResolvedClaims[i]
+			return &resolved
+		}
+	}
+	return nil
+}
+
+// ResolveRejectedClaim 把一笔已明确拒绝的领取按对侧已确认事实收尾：
+// 拒绝记录保留，金额计入本侧收款人并留下收尾痕迹。相同 claimID 重复调用幂等。
+func (l *Ledger) ResolveRejectedClaim(id, claimID string) (*Escrow, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	escrow := l.escrows[id]
+	if escrow == nil {
+		return nil, ErrMissing
+	}
+	if resolved := escrow.ResolvedClaimByID(claimID); resolved != nil {
+		return cloneEscrow(escrow), nil
+	}
+	var rejected *RejectedClaim
+	for i := range escrow.RejectedClaims {
+		if escrow.RejectedClaims[i].ClaimID == claimID {
+			rejected = &escrow.RejectedClaims[i]
+			break
+		}
+	}
+	if rejected == nil {
+		return nil, ErrPendingClaim
+	}
+	amount := rejected.Amount
+	remaining := escrow.Amount - escrow.ClaimedAmount - escrow.RefundedAmount
+	if amount > remaining {
+		return nil, ErrInvalidAmount
+	}
+	to := l.accounts[escrow.To]
+	to.Balance += amount
+	escrow.ClaimedAmount += amount
+	escrow.Claims = append(escrow.Claims, ClaimRecord{ClaimID: claimID, Amount: amount, Confirmed: escrow.ClaimedAmount, Remaining: escrow.Amount - escrow.ClaimedAmount - escrow.RefundedAmount, Time: l.clock.Now()})
+	escrow.ResolvedClaims = append(escrow.ResolvedClaims, ResolvedClaim{ClaimID: claimID, Amount: amount, Reason: rejected.Reason, Time: l.clock.Now()})
+	switch {
+	case escrow.ClaimedAmount+escrow.RefundedAmount == escrow.Amount:
+		if escrow.RefundedAmount == 0 {
+			escrow.Status = StatusClaimed
+		} else {
+			escrow.Status = StatusRefunded
+		}
+	case escrow.RefundedAmount > 0:
+		escrow.Status = StatusPartiallyRefunded
+	default:
+		escrow.Status = StatusPartiallyClaimed
+	}
+	escrow.UpdatedAt = l.clock.Now()
+	return cloneEscrow(escrow), l.saveLocked()
+}
+
 func (l *Ledger) RefundPartial(id string, amount uint64) (*Escrow, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -367,6 +436,7 @@ func cloneEscrow(in *Escrow) *Escrow {
 	out.Secret = append([]byte(nil), in.Secret...)
 	out.Claims = append([]ClaimRecord(nil), in.Claims...)
 	out.RejectedClaims = append([]RejectedClaim(nil), in.RejectedClaims...)
+	out.ResolvedClaims = append([]ResolvedClaim(nil), in.ResolvedClaims...)
 	return &out
 }
 

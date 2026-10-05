@@ -12,10 +12,11 @@ import (
 )
 
 const (
-	KindLock   = "lock"
-	KindClaim  = "claim"
-	KindRefund = "refund"
-	KindAck    = "ack"
+	KindLock    = "lock"
+	KindClaim   = "claim"
+	KindRefund  = "refund"
+	KindResolve = "resolve"
+	KindAck     = "ack"
 )
 
 type Message struct {

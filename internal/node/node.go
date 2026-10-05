@@ -33,6 +33,11 @@ type IDPayload struct {
 	Amount   uint64 `json:"amount,omitempty"`
 }
 
+type ResolvePayload struct {
+	EscrowID string `json:"escrow_id"`
+	ClaimID  string `json:"claim_id"`
+}
+
 type AckPayload struct {
 	Correlation string `json:"correlation"`
 	Status      string `json:"status"`
@@ -101,6 +106,16 @@ func (n *Node) Handle(msg message.Message) (*message.Message, error) {
 		if err == nil {
 			var escrow *ledger.Escrow
 			escrow, err = n.ledger.RefundPartial(p.EscrowID, p.Amount)
+			if escrow != nil {
+				ack.Status = escrow.Status
+			}
+		}
+		handleErr = err
+	case message.KindResolve:
+		p, err := message.Decode[ResolvePayload](msg)
+		if err == nil {
+			var escrow *ledger.Escrow
+			escrow, err = n.ledger.ResolveRejectedClaim(p.EscrowID, p.ClaimID)
 			if escrow != nil {
 				ack.Status = escrow.Status
 			}
